@@ -8882,14 +8882,16 @@ static int kv_cache_try_load_text(server *s, const char *prompt_text,
                                   ds4_tokens *effective_prompt,
                                   char **loaded_path_out,
                                   uint8_t *loaded_ext_flags_out,
-                                  bool responses_protocol) {
+                                  bool responses_protocol,
+                                  bool consume_loaded) {
     if (loaded_path_out) *loaded_path_out = NULL;
     if (loaded_ext_flags_out) *loaded_ext_flags_out = 0;
     ds4_kvstore_load_result lr = {0};
     ds4_kvstore_trailer_hooks hooks = kv_cache_tool_map_hooks(s, NULL);
     int loaded = ds4_kvstore_try_load_text(&s->kv, s->engine, s->session,
                                            prompt_text, effective_prompt, &lr,
-                                           &hooks, responses_protocol);
+                                           &hooks, responses_protocol,
+                                           consume_loaded);
     if (loaded > 0) {
         if (loaded_path_out && lr.path) *loaded_path_out = xstrdup(lr.path);
         if (loaded_ext_flags_out) *loaded_ext_flags_out = lr.ext_flags;
@@ -8906,7 +8908,8 @@ static int kv_cache_try_load(server *s, const request *req,
                                   effective_prompt,
                                   loaded_path_out,
                                   loaded_ext_flags_out,
-                                  req && req->api == API_RESPONSES);
+                                  req && req->api == API_RESPONSES,
+                                  true);
 }
 
 static int live_text_prefix_prompt(server *s, const request *req,
@@ -9759,7 +9762,8 @@ static bool restore_clean_prompt_frontier(server *s, const request *req,
     uint8_t ext_flags = 0;
     int loaded = kv_cache_try_load_text(s, req->prompt_text, &effective,
                                         &path, &ext_flags,
-                                        req->api == API_RESPONSES);
+                                        req->api == API_RESPONSES,
+                                        false);
     (void)ext_flags;
     if (loaded <= 0) {
         ds4_session_invalidate(s->session);
@@ -9969,7 +9973,8 @@ static void canonicalize_tool_checkpoint(server *s, const job *j, const char *ct
         char *path = NULL;
         ds4_tokens effective = {0};
         int loaded = kv_cache_try_load_text(s, rendered.ptr ? rendered.ptr : "",
-                                            &effective, &path, NULL, false);
+                                            &effective, &path, NULL, false,
+                                            true);
         if (loaded == 0) ds4_session_invalidate(s->session);
 
         char sync_err[160] = {0};

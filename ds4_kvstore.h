@@ -199,7 +199,8 @@ int ds4_kvstore_try_load_text(ds4_kvstore *kc,
                               ds4_tokens *effective_prompt,
                               ds4_kvstore_load_result *result,
                               const ds4_kvstore_trailer_hooks *hooks,
-                              bool responses_protocol);
+                              bool responses_protocol,
+                              bool consume_loaded);
 void ds4_kvstore_load_result_free(ds4_kvstore_load_result *result);
 
 bool ds4_kvstore_read_header(FILE *fp, ds4_kvstore_entry *e,

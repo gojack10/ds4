@@ -1228,7 +1228,8 @@ int ds4_kvstore_try_load_text(ds4_kvstore *kc,
                               ds4_tokens *effective_prompt,
                               ds4_kvstore_load_result *result,
                               const ds4_kvstore_trailer_hooks *hooks,
-                              bool responses_protocol) {
+                              bool responses_protocol,
+                              bool consume_loaded) {
     if (result) memset(result, 0, sizeof(*result));
     if (effective_prompt) effective_prompt->len = 0;
     if (!kc->enabled || !prompt_text) return 0;
@@ -1328,7 +1329,7 @@ int ds4_kvstore_try_load_text(ds4_kvstore *kc,
         kc->continued_last_store_tokens = loaded;
         const char *key_kind = ds4_kvstore_key_kind(hdr.ext_flags);
         bool consumed = false;
-        if (kc->opt.cold_max_tokens > 0 && loaded > kc->opt.cold_max_tokens) {
+        if (consume_loaded && kc->opt.cold_max_tokens > 0 && loaded > kc->opt.cold_max_tokens) {
             unlink(path);
             consumed = true;
             kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
