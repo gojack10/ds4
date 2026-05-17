@@ -7628,6 +7628,22 @@ typedef struct {
     size_t visible_len;
 } visible_live_state;
 
+typedef enum {
+    SERVER_ACTIVITY_NONE = 0,
+    SERVER_ACTIVITY_PREFILL,
+    SERVER_ACTIVITY_DECODE,
+} server_activity_phase;
+
+typedef struct {
+    server_activity_phase phase;
+    int processed;
+    int total;
+    int generated_tokens;
+    double tok_s;
+    double eta;
+    double updated_at;
+} server_activity;
+
 static bool id_list_contains(const stop_list *ids, const char *id);
 static void id_list_push_unique(stop_list *ids, const char *id);
 
@@ -7643,6 +7659,8 @@ struct server {
     bool disable_exact_dsml_tool_replay;
     bool enable_cors;
     pthread_mutex_t tool_mu;
+    pthread_mutex_t activity_mu;
+    server_activity activity;
     pthread_mutex_t mu;
     pthread_cond_t cv;
     pthread_cond_t clients_cv;
@@ -7655,6 +7673,41 @@ struct server {
     pthread_mutex_t trace_mu;
     uint64_t trace_seq;
 };
+
+static void server_activity_clear(server *s) {
+    if (!s) return;
+    pthread_mutex_lock(&s->activity_mu);
+    memset(&s->activity, 0, sizeof(s->activity));
+    pthread_mutex_unlock(&s->activity_mu);
+}
+
+static void server_activity_set_prefill(server *s, int processed, int total,
+                                        double tok_s, double eta) {
+    if (!s) return;
+    pthread_mutex_lock(&s->activity_mu);
+    s->activity.phase = SERVER_ACTIVITY_PREFILL;
+    s->activity.processed = processed;
+    s->activity.total = total;
+    s->activity.generated_tokens = 0;
+    s->activity.tok_s = tok_s;
+    s->activity.eta = eta;
+    s->activity.updated_at = now_sec();
+    pthread_mutex_unlock(&s->activity_mu);
+}
+
+static void server_activity_set_decode(server *s, int generated_tokens,
+                                       double tok_s) {
+    if (!s) return;
+    pthread_mutex_lock(&s->activity_mu);
+    s->activity.phase = SERVER_ACTIVITY_DECODE;
+    s->activity.processed = 0;
+    s->activity.total = 0;
+    s->activity.generated_tokens = generated_tokens;
+    s->activity.tok_s = tok_s;
+    s->activity.eta = 0.0;
+    s->activity.updated_at = now_sec();
+    pthread_mutex_unlock(&s->activity_mu);
+}
 
 /* Jobs are stack-owned by the client thread.  The worker signals completion
  * after the response has been written, so request data and the socket remain
@@ -10232,6 +10285,9 @@ static void server_progress_cb(void *ud, const char *event, int current, int tot
     char flags[64];
     log_flags(flags, sizeof(flags), p->responses_protocol,
               p->has_tools, false, false, false);
+    double display_tps = chunk_tps > 0.0 ? chunk_tps : avg_tps;
+    double eta = display_tps > 0.0 ? (double)(display_total - display_current) / display_tps : 0.0;
+    server_activity_set_prefill(p->srv, display_current, display_total, display_tps, eta);
     const char *phase = p->phase ? p->phase : "prefill";
     server_log(DS4_LOG_PREFILL,
                "ds4-server: %s ctx=%s%s%s %s chunk %d/%d (%.1f%%) chunk=%.2f t/s avg=%.2f t/s %.3fs",
@@ -10703,6 +10759,9 @@ static void generate_job(server *s, job *j) {
                req_flags[0] ? " " : "",
                req_flags);
     ds4_session_set_progress(s->session, server_progress_cb, &progress);
+    server_activity_set_prefill(s, 0,
+                                prompt_tokens > cached ? prompt_tokens - cached : prompt_tokens,
+                                0.0, 0.0);
 
     int cold_store_len = 0;
     if (cached == 0 &&
@@ -10792,6 +10851,8 @@ static void generate_job(server *s, job *j) {
     snprintf(id, sizeof(id), "%s-%llu",
              j->req.kind == REQ_CHAT ? "chatcmpl" : "cmpl",
              (unsigned long long)++s->seq);
+
+    server_activity_set_decode(s, 0, 0.0);
 
     bool structured_stream = request_uses_structured_stream(&j->req);
     anthropic_stream anthropic_live = {0};
@@ -10935,6 +10996,9 @@ static void generate_job(server *s, job *j) {
             size_t piece_len = 0;
             char *piece = ds4_token_text(s->engine, token, &piece_len);
             completion++;
+            double decode_elapsed_now = now_sec() - decode_t0;
+            server_activity_set_decode(s, completion,
+                                       decode_elapsed_now > 0.0 ? (double)completion / decode_elapsed_now : 0.0);
 
             trace_piece(s, trace_id, piece, piece_len);
             buf_append(&text, piece, piece_len);
@@ -11385,6 +11449,7 @@ static void *worker_main(void *arg) {
         job *j = dequeue(s);
         if (!j) break;
         generate_job(s, j);
+        server_activity_clear(s);
         pthread_mutex_lock(&j->mu);
         j->done = true;
         pthread_cond_signal(&j->cv);
@@ -11538,6 +11603,32 @@ static bool send_models(server *s, int fd) {
     return ok;
 }
 
+static bool send_admin_stats(server *s, int fd) {
+    server_activity a;
+    pthread_mutex_lock(&s->activity_mu);
+    a = s->activity;
+    pthread_mutex_unlock(&s->activity_mu);
+
+    buf b = {0};
+    buf_puts(&b, "{\"active_models\":{\"models\":[{\"id\":\"deepseek-v4-flash\",");
+    buf_puts(&b, "\"prefilling\":[");
+    if (a.phase == SERVER_ACTIVITY_PREFILL) {
+        buf_printf(&b,
+                   "{\"processed\":%d,\"total\":%d,\"speed\":%.6f,\"eta\":%.6f}",
+                   a.processed, a.total, a.tok_s, a.eta);
+    }
+    buf_puts(&b, "],\"generating\":[");
+    if (a.phase == SERVER_ACTIVITY_DECODE) {
+        buf_printf(&b,
+                   "{\"generated_tokens\":%d,\"tokens_per_second\":%.6f,\"elapsed_seconds\":1.0}",
+                   a.generated_tokens, a.tok_s);
+    }
+    buf_puts(&b, "]}]}}\n");
+    bool ok = http_response(fd, s->enable_cors, 200, "application/json", b.ptr);
+    buf_free(&b);
+    return ok;
+}
+
 static void client_done(server *s) {
     pthread_mutex_lock(&s->mu);
     if (s->clients > 0) s->clients--;
@@ -11572,6 +11663,11 @@ static void *client_main(void *arg) {
     }
     if (!strcmp(hr.method, "GET") && !strcmp(hr.path, "/v1/models/deepseek-v4-flash")) {
         send_model(s, fd);
+        http_request_free(&hr);
+        goto done;
+    }
+    if (!strcmp(hr.method, "GET") && !strcmp(hr.path, "/admin/api/stats")) {
+        send_admin_stats(s, fd);
         http_request_free(&hr);
         goto done;
     }
@@ -11759,6 +11855,7 @@ static void server_close_resources(server *s) {
     live_tool_state_free(&s->anthropic_live);
     visible_live_free(&s->thinking_live);
     pthread_mutex_destroy(&s->tool_mu);
+    pthread_mutex_destroy(&s->activity_mu);
     pthread_mutex_destroy(&s->trace_mu);
     pthread_cond_destroy(&s->clients_cv);
     pthread_cond_destroy(&s->cv);
@@ -12034,6 +12131,7 @@ int main(int argc, char **argv) {
     pthread_cond_init(&s.cv, NULL);
     pthread_cond_init(&s.clients_cv, NULL);
     pthread_mutex_init(&s.tool_mu, NULL);
+    pthread_mutex_init(&s.activity_mu, NULL);
     pthread_mutex_init(&s.trace_mu, NULL);
     if (cfg.trace_path) {
         s.trace = fopen(cfg.trace_path, "w");
