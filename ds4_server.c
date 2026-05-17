@@ -9779,50 +9779,26 @@ static bool restore_clean_prompt_frontier(server *s, const request *req,
         return false;
     }
 
-    char sync_err[160] = {0};
     char replay_ctx[48];
     request_ctx_span(replay_ctx, sizeof(replay_ctx), loaded, effective.len);
     int replay_tokens = effective.len - loaded;
     if (replay_tokens < 0) replay_tokens = effective.len;
-    const double recovery_t0 = now_sec();
+
+    /* Do not eagerly replay the old request suffix during abort cleanup.  The
+     * next client request may retokenize or rewrite the last few visible bytes,
+     * causing a second rollback anyway.  Leaving the live session at the clean
+     * disk frontier makes the next request replay the suffix exactly once, via
+     * memory-text or disk-prefix matching, and never trusts aborted decode KV. */
     server_log(DS4_LOG_KVCACHE,
-               "ds4-server: abort recovery replay ctx=%s request_ctx=%s cached=%d replay=%d target=%d file=%s",
-               replay_ctx, ctx ? ctx : "?", loaded, replay_tokens,
+               "ds4-server: clean abort checkpoint restored ctx=%s request_ctx=%s deferred_replay=%d target=%d file=%s",
+               replay_ctx, ctx ? ctx : "?", replay_tokens,
                effective.len, path ? path : "");
-    server_prefill_progress recovery_progress = {
-        .srv = s,
-        .kind = req->kind,
-        .prompt_tokens = effective.len,
-        .cached_tokens = loaded,
-        .phase = "abort recovery replay",
-        .has_tools = req->has_tools,
-        .responses_protocol = req->api == API_RESPONSES,
-        .t0 = recovery_t0,
-    };
-    snprintf(recovery_progress.ctx, sizeof(recovery_progress.ctx), "%s", replay_ctx);
-    ds4_session_set_progress(s->session, server_progress_cb, &recovery_progress);
-    bool ok = ds4_session_sync(s->session, &effective, sync_err, sizeof(sync_err)) == 0;
-    ds4_session_set_progress(s->session, NULL, NULL);
-    if (ok) {
-        server_log(DS4_LOG_KVCACHE,
-                   "ds4-server: clean prompt frontier restored ctx=%s cached=%d replay=%d target=%d %.3fs",
-                   replay_ctx, loaded, replay_tokens, effective.len,
-                   now_sec() - recovery_t0);
-        trace_event(s, trace_id,
-                    "clean prompt frontier restored: cached=%d replay=%d target=%d file=%s",
-                    loaded, replay_tokens, effective.len, path ? path : "");
-    } else {
-        ds4_session_invalidate(s->session);
-        s->kv.continued_last_store_tokens = 0;
-        server_log(DS4_LOG_WARNING,
-                   "ds4-server: abort recovery replay failed ctx=%s cached=%d replay=%d target=%d error=\"%s\"",
-                   replay_ctx, loaded, replay_tokens, effective.len, sync_err);
-        trace_event(s, trace_id,
-                    "abort recovery failed after disk load: %s", sync_err);
-    }
+    trace_event(s, trace_id,
+                "clean abort checkpoint restored: cached=%d deferred_replay=%d target=%d file=%s",
+                loaded, replay_tokens, effective.len, path ? path : "");
     ds4_tokens_free(&effective);
     free(path);
-    return ok;
+    return true;
 }
 
 static char *build_tool_checkpoint_suffix(const request *r, const char *content,
