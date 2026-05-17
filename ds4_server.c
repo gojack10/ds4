@@ -8747,7 +8747,8 @@ static bool kv_cache_store_live_prefix_text(server *s, const ds4_tokens *tokens,
                                             int store_len, const char *reason,
                                             const char *cache_text_override,
                                             uint8_t cache_text_ext,
-                                            const char *cache_text_key) {
+                                            const char *cache_text_key,
+                                            const char *protected_sha_extra) {
     char err[160] = {0};
     ds4_kvstore_trailer_hooks hooks = kv_cache_tool_map_hooks(s, NULL);
     return ds4_kvstore_store_live_prefix_text(&s->kv, s->engine, s->session,
@@ -8755,16 +8756,18 @@ static bool kv_cache_store_live_prefix_text(server *s, const ds4_tokens *tokens,
                                               cache_text_override,
                                               cache_text_ext,
                                               cache_text_key,
+                                              protected_sha_extra,
                                               &hooks, err, sizeof(err));
 }
 
 static bool kv_cache_store_live_prefix(server *s, const ds4_tokens *tokens,
                                        int store_len, const char *reason) {
     return kv_cache_store_live_prefix_text(s, tokens, store_len, reason,
-                                           NULL, 0, NULL);
+                                           NULL, 0, NULL, NULL);
 }
 
-static void kv_cache_store_current(server *s, const char *reason) {
+static void kv_cache_store_current_protected(server *s, const char *reason,
+                                             const char *protected_sha_extra) {
     const ds4_tokens *tokens = ds4_session_tokens(s->session);
     if (!tokens) return;
 
@@ -8798,11 +8801,17 @@ static void kv_cache_store_current(server *s, const char *reason) {
      * tokenizes only the visible suffix that follows this key. */
     if (visible_text) {
         kv_cache_store_live_prefix_text(s, tokens, tokens->len, reason,
-                                        visible_text, visible_ext, visible_key);
+                                        visible_text, visible_ext, visible_key,
+                                        protected_sha_extra);
         free(visible_text);
     } else {
-        kv_cache_store_live_prefix(s, tokens, tokens->len, reason);
+        kv_cache_store_live_prefix_text(s, tokens, tokens->len, reason,
+                                        NULL, 0, NULL, protected_sha_extra);
     }
+}
+
+static void kv_cache_store_current(server *s, const char *reason) {
+    kv_cache_store_current_protected(s, reason, NULL);
 }
 
 static void kv_cache_note_store(kv_disk_cache *kc, int tokens) {
@@ -8851,6 +8860,23 @@ static int kv_cache_find_text_prefix(kv_disk_cache *kc, const char *prompt_text,
     return ds4_kvstore_find_text_prefix(kc, prompt_text, 0, quant_bits, ctx_size);
 }
 #endif
+
+static bool kv_cache_best_text_prefix_sha(server *s, const char *prompt_text,
+                                          char sha_out[41], int *tokens_out) {
+    if (sha_out) sha_out[0] = '\0';
+    if (tokens_out) *tokens_out = 0;
+    if (!s || !prompt_text || !s->kv.enabled) return false;
+    const int quant_bits = ds4_engine_routed_quant_bits(s->engine);
+    if (quant_bits != 2 && quant_bits != 4) return false;
+    int idx = ds4_kvstore_find_text_prefix(&s->kv, prompt_text,
+                                           ds4_engine_model_id(s->engine),
+                                           quant_bits,
+                                           ds4_session_ctx(s->session));
+    if (idx < 0) return false;
+    if (sha_out) snprintf(sha_out, 41, "%.40s", s->kv.entry[idx].sha);
+    if (tokens_out) *tokens_out = (int)s->kv.entry[idx].tokens;
+    return true;
+}
 
 static int kv_cache_try_load_text(server *s, const char *prompt_text,
                                   ds4_tokens *effective_prompt,
@@ -9699,6 +9725,102 @@ static void send_prefill_failure_response(server *s, const job *j,
     http_error(j->fd, s->enable_cors, 500, err);
 }
 
+static bool restore_clean_prompt_frontier(server *s, const request *req,
+                                          const ds4_tokens *prompt_for_sync,
+                                          const char *ctx,
+                                          uint64_t trace_id,
+                                          const char *reason) {
+    if (!s || !req || !prompt_for_sync) return false;
+    const char *why = reason && reason[0] ? reason : "client stream failed";
+    server_log(DS4_LOG_WARNING,
+               "ds4-server: client stream aborted; restoring clean prompt frontier ctx=%s prompt=%d reason=\"%s\"",
+               ctx ? ctx : "?", prompt_for_sync->len, why);
+    trace_event(s, trace_id,
+                "client stream aborted; restoring clean prompt frontier prompt=%d reason=%s",
+                prompt_for_sync->len, why);
+
+    responses_live_clear(s);
+    anthropic_live_clear(s);
+    thinking_live_clear(s);
+
+    if (!s->kv.enabled || !req->prompt_text || !req->prompt_text[0]) {
+        ds4_session_invalidate(s->session);
+        s->kv.continued_last_store_tokens = 0;
+        server_log(DS4_LOG_WARNING,
+                   "ds4-server: client stream aborted; no disk cache lookup possible, invalidated live session ctx=%s",
+                   ctx ? ctx : "?");
+        trace_event(s, trace_id,
+                    "abort recovery invalidated live session: no disk cache lookup possible");
+        return false;
+    }
+
+    ds4_tokens effective = {0};
+    char *path = NULL;
+    uint8_t ext_flags = 0;
+    int loaded = kv_cache_try_load_text(s, req->prompt_text, &effective,
+                                        &path, &ext_flags,
+                                        req->api == API_RESPONSES);
+    (void)ext_flags;
+    if (loaded <= 0) {
+        ds4_session_invalidate(s->session);
+        s->kv.continued_last_store_tokens = 0;
+        server_log(DS4_LOG_WARNING,
+                   "ds4-server: client stream aborted; no clean disk checkpoint found, invalidated live session ctx=%s prompt=%d",
+                   ctx ? ctx : "?", prompt_for_sync->len);
+        trace_event(s, trace_id,
+                    "abort recovery invalidated live session: no clean disk checkpoint found prompt=%d",
+                    prompt_for_sync->len);
+        ds4_tokens_free(&effective);
+        free(path);
+        return false;
+    }
+
+    char sync_err[160] = {0};
+    char replay_ctx[48];
+    request_ctx_span(replay_ctx, sizeof(replay_ctx), loaded, effective.len);
+    int replay_tokens = effective.len - loaded;
+    if (replay_tokens < 0) replay_tokens = effective.len;
+    const double recovery_t0 = now_sec();
+    server_log(DS4_LOG_KVCACHE,
+               "ds4-server: abort recovery replay ctx=%s request_ctx=%s cached=%d replay=%d target=%d file=%s",
+               replay_ctx, ctx ? ctx : "?", loaded, replay_tokens,
+               effective.len, path ? path : "");
+    server_prefill_progress recovery_progress = {
+        .srv = s,
+        .kind = req->kind,
+        .prompt_tokens = effective.len,
+        .cached_tokens = loaded,
+        .phase = "abort recovery replay",
+        .has_tools = req->has_tools,
+        .responses_protocol = req->api == API_RESPONSES,
+        .t0 = recovery_t0,
+    };
+    snprintf(recovery_progress.ctx, sizeof(recovery_progress.ctx), "%s", replay_ctx);
+    ds4_session_set_progress(s->session, server_progress_cb, &recovery_progress);
+    bool ok = ds4_session_sync(s->session, &effective, sync_err, sizeof(sync_err)) == 0;
+    ds4_session_set_progress(s->session, NULL, NULL);
+    if (ok) {
+        server_log(DS4_LOG_KVCACHE,
+                   "ds4-server: clean prompt frontier restored ctx=%s cached=%d replay=%d target=%d %.3fs",
+                   replay_ctx, loaded, replay_tokens, effective.len,
+                   now_sec() - recovery_t0);
+        trace_event(s, trace_id,
+                    "clean prompt frontier restored: cached=%d replay=%d target=%d file=%s",
+                    loaded, replay_tokens, effective.len, path ? path : "");
+    } else {
+        ds4_session_invalidate(s->session);
+        s->kv.continued_last_store_tokens = 0;
+        server_log(DS4_LOG_WARNING,
+                   "ds4-server: abort recovery replay failed ctx=%s cached=%d replay=%d target=%d error=\"%s\"",
+                   replay_ctx, loaded, replay_tokens, effective.len, sync_err);
+        trace_event(s, trace_id,
+                    "abort recovery failed after disk load: %s", sync_err);
+    }
+    ds4_tokens_free(&effective);
+    free(path);
+    return ok;
+}
+
 static char *build_tool_checkpoint_suffix(const request *r, const char *content,
                                           const char *reasoning, const tool_calls *calls) {
     buf suffix = {0};
@@ -10070,8 +10192,20 @@ static void generate_job(server *s, job *j) {
     if (s->kv.enabled && cached == 0 && old_pos >= s->kv.opt.min_tokens) {
         /* Loading a disk snapshot replaces the live Metal session.  Persist the
          * current checkpoint first, otherwise a cache hit for an older prefix
-         * would silently discard the newer conversation state. */
-        kv_cache_store_current(s, "evict");
+         * would silently discard the newer conversation state.  Also protect the
+         * best incoming prompt prefix from this eviction pass; that checkpoint
+         * is exactly what we are about to try loading to avoid a full replay. */
+        char incoming_sha[41] = {0};
+        int incoming_tokens = 0;
+        kv_cache_best_text_prefix_sha(s, j->req.prompt_text, incoming_sha,
+                                      &incoming_tokens);
+        if (incoming_sha[0]) {
+            server_log(DS4_LOG_KVCACHE,
+                       "ds4-server: kv cache protecting incoming prefix tokens=%d sha=%.12s before live-store eviction",
+                       incoming_tokens, incoming_sha);
+        }
+        kv_cache_store_current_protected(s, "evict",
+                                         incoming_sha[0] ? incoming_sha : NULL);
     }
     if (cached == 0) {
         disk_cached = kv_cache_try_load(s, &j->req, &effective_prompt,
@@ -10265,6 +10399,7 @@ static void generate_job(server *s, job *j) {
 
     server_activity_set_decode(s, 0, 0.0);
 
+    bool client_stream_failed = false;
     bool structured_stream = request_uses_structured_stream(&j->req);
     anthropic_stream anthropic_live = {0};
     openai_stream openai_live = {0};
@@ -10274,6 +10409,7 @@ static void generate_job(server *s, job *j) {
     long responses_created_at = (long)time(NULL);
     if (j->req.stream) {
         if (progress.stream_failed) {
+            client_stream_failed = true;
             server_log(DS4_LOG_GENERATION,
                        "ds4-server: %s ctx=%s%s%s stream closed during prefill",
                        j->req.kind == REQ_CHAT ? "chat" : "completion",
@@ -10287,6 +10423,7 @@ static void generate_job(server *s, job *j) {
          * to keep the connection alive during a long prefill. Only emit them
          * here when prefill never fired (e.g. fully cached prompt). */
         if (!progress.headers_sent && !sse_headers(j->fd, s->enable_cors)) {
+            client_stream_failed = true;
             server_log(DS4_LOG_GENERATION,
                        "ds4-server: %s ctx=%s%s%s sse headers failed",
                        j->req.kind == REQ_CHAT ? "chat" : "completion",
@@ -10300,12 +10437,14 @@ static void generate_job(server *s, job *j) {
         if (j->req.api == API_ANTHROPIC &&
             !anthropic_sse_start_live(j->fd, &j->req, id,
                                       prompt_tokens, &anthropic_live)) {
+            client_stream_failed = true;
             server_log(DS4_LOG_GENERATION, "ds4-server: chat ctx=%s anthropic stream start failed", ctx_span);
             ds4_tokens_free(&effective_prompt);
             return;
         }
         if (j->req.api == API_OPENAI && j->req.kind == REQ_CHAT &&
             !sse_chunk(j->fd, &j->req, id, NULL, NULL)) {
+            client_stream_failed = true;
             server_log(DS4_LOG_GENERATION, "ds4-server: chat ctx=%s openai role chunk failed", ctx_span);
             ds4_tokens_free(&effective_prompt);
             return;
@@ -10315,6 +10454,7 @@ static void generate_job(server *s, job *j) {
             responses_stream_init(&j->req, &responses_live);
             responses_live.active = true;
             if (!responses_sse_created(j->fd, &j->req, &responses_live, responses_created_at)) {
+                client_stream_failed = true;
                 server_log(DS4_LOG_GENERATION,
                            "ds4-server: chat ctx=%s%s%s responses created event failed",
                            ctx_span,
@@ -10363,7 +10503,14 @@ decode_again:
         dsml_decode_state dsml_state = j->req.kind == REQ_CHAT && j->req.has_tools ?
             dsml_tracker.decode : DSML_DECODE_OUTSIDE;
         const bool in_tool_call = dsml_decode_state_is_tool(dsml_state);
-        if (!(j->req.kind == REQ_CHAT && j->req.has_tools && (saw_tool_start || in_tool_call))) {
+        if (!j->req.stream &&
+            !(j->req.kind == REQ_CHAT && j->req.has_tools && (saw_tool_start || in_tool_call))) {
+            /* Streamed assistant tokens are not committed until the client
+             * receives the stream.  Do not persist mid-decode KV checkpoints
+             * for them; an Esc/disconnect would otherwise turn partial output
+             * into a durable prefix that the next client transcript will not
+             * replay.  Prompt-prefill progress still writes clean continued
+             * checkpoints before decoding starts. */
             kv_cache_maybe_store_continued(s);
         }
         float temperature = j->req.temperature;
@@ -10455,6 +10602,7 @@ decode_again:
                 free(delta);
                 if (!ok) {
                     finish = "error";
+                    client_stream_failed = true;
                     snprintf(err, sizeof(err), "client stream write failed");
                     free(piece);
                     stop_decode = true;
@@ -10467,6 +10615,7 @@ decode_again:
                                              &anthropic_live, text.ptr, stream_len,
                                              false)) {
                 finish = "error";
+                client_stream_failed = true;
                 snprintf(err, sizeof(err), "client stream write failed");
                 free(piece);
                 stop_decode = true;
@@ -10477,6 +10626,7 @@ decode_again:
                                           &openai_live, text.ptr, stream_len,
                                           false)) {
                 finish = "error";
+                client_stream_failed = true;
                 snprintf(err, sizeof(err), "client stream write failed");
                 free(piece);
                 stop_decode = true;
@@ -10487,6 +10637,7 @@ decode_again:
                                              &responses_live, text.ptr, stream_len,
                                              false)) {
                 finish = "error";
+                client_stream_failed = true;
                 snprintf(err, sizeof(err), "client stream write failed");
                 free(piece);
                 stop_decode = true;
@@ -10671,7 +10822,11 @@ decode_again:
 
     if (j->req.stream && !structured_stream && text.len > plain_stream_pos) {
         char *tail = xstrndup(text.ptr + plain_stream_pos, text.len - plain_stream_pos);
-        if (!sse_chunk(j->fd, &j->req, id, tail, NULL)) finish = "error";
+        if (!sse_chunk(j->fd, &j->req, id, tail, NULL)) {
+            finish = "error";
+            client_stream_failed = true;
+            snprintf(err, sizeof(err), "client stream write failed");
+        }
         free(tail);
     }
 
@@ -10680,7 +10835,7 @@ decode_again:
     char *parsed_reasoning = NULL;
     const char *final_finish = finish;
     bool recovered_tool_parse_failure = false;
-    if (j->req.kind == REQ_CHAT) {
+    if (!client_stream_failed && j->req.kind == REQ_CHAT) {
         bool parsed_ok = parse_generated_message_for_response(
             text.ptr ? text.ptr : "",
             j->req.has_tools,
@@ -10782,10 +10937,7 @@ decode_again:
             if (j->req.api == API_ANTHROPIC && j->req.stream)
                 apply_anthropic_stream_tool_ids(&parsed_calls, &anthropic_live);
             assign_tool_call_ids(s, &parsed_calls, j->req.api);
-            tool_memory_remember(s, &parsed_calls);
             final_finish = "tool_calls";
-        } else if (j->req.api == API_RESPONSES) {
-            responses_live_clear(s);
         }
     }
     log_tool_calls_summary(ctx_span, &parsed_calls,
@@ -10796,6 +10948,89 @@ decode_again:
                  parsed_content ? parsed_content : (text.ptr ? text.ptr : ""),
                  parsed_reasoning, &parsed_calls, now_sec() - t0);
 
+    if (client_stream_failed) {
+        restore_clean_prompt_frontier(s, &j->req, prompt_for_sync, ctx_span,
+                                      trace_id,
+                                      err[0] ? err : "client stream write failed");
+        goto finish_log;
+    }
+
+    if (j->req.stream) {
+        bool response_ok = true;
+        if (j->req.api == API_ANTHROPIC) {
+            response_ok = anthropic_sse_finish_live(j->fd, s, &j->req, id, &anthropic_live,
+                                                    text.ptr ? text.ptr : "", text.len,
+                                                    &parsed_calls, final_finish, completion);
+        } else if (openai_live_chat) {
+            response_ok = openai_sse_finish_live(j->fd, s, &j->req, id, &openai_live,
+                                                 text.ptr ? text.ptr : "", text.len,
+                                                 &parsed_calls, final_finish,
+                                                 prompt_tokens, completion);
+        } else if (responses_live_chat) {
+            /* If parse recovered a malformed tool call back to plain text,
+             * pass parsed_content so the streaming tail can be flushed; in
+             * the normal path parsed_content is the assistant text we already
+             * streamed and the diff is empty. */
+            const char *recover =
+                recovered_tool_parse_failure ? parsed_content : NULL;
+            response_ok = responses_sse_finish_live(j->fd, &j->req, &responses_live,
+                                                    text.ptr ? text.ptr : "", text.len,
+                                                    recover,
+                                                    &parsed_calls, final_finish,
+                                                    prompt_tokens, completion,
+                                                    responses_created_at);
+        } else if (structured_stream) {
+            response_ok = sse_chat_finish(j->fd, &j->req, id,
+                                          parsed_content ? parsed_content : (text.ptr ? text.ptr : ""),
+                                          parsed_reasoning,
+                                          &parsed_calls, final_finish,
+                                          prompt_tokens, completion);
+        } else {
+            response_ok = sse_chunk(j->fd, &j->req, id, NULL, final_finish) &&
+                          sse_done(j->fd, &j->req, id, prompt_tokens, completion);
+        }
+        if (!response_ok) {
+            finish = "error";
+            final_finish = "error";
+            client_stream_failed = true;
+            snprintf(err, sizeof(err), "client stream write failed");
+            server_log(DS4_LOG_DEFAULT,
+                       "ds4-server: %s ctx=%s%s%s final stream failed",
+                       j->req.kind == REQ_CHAT ? "chat" : "completion",
+                       ctx_span,
+                       req_flags[0] ? " " : "",
+                       req_flags);
+            trace_event(s, trace_id, "final stream failed; treating generation as aborted");
+            restore_clean_prompt_frontier(s, &j->req, prompt_for_sync, ctx_span,
+                                          trace_id, err);
+            goto finish_log;
+        }
+    } else if (j->req.api == API_ANTHROPIC) {
+        anthropic_final_response(j->fd, s->enable_cors, &j->req, id,
+                                 parsed_content ? parsed_content : (text.ptr ? text.ptr : ""),
+                                 parsed_reasoning,
+                                 &parsed_calls, final_finish,
+                                 prompt_tokens, completion);
+    } else if (j->req.api == API_RESPONSES) {
+        responses_final_response(j->fd, s->enable_cors, &j->req, id,
+                                 parsed_content ? parsed_content : (text.ptr ? text.ptr : ""),
+                                 parsed_reasoning,
+                                 &parsed_calls, final_finish,
+                                 prompt_tokens, completion);
+    } else {
+        final_response(j->fd, s->enable_cors, &j->req, id,
+                       parsed_content ? parsed_content : (text.ptr ? text.ptr : ""),
+                       parsed_reasoning,
+                       &parsed_calls, final_finish,
+                       prompt_tokens, completion);
+    }
+
+    /* Commit generated side effects only after a streaming response has been
+     * accepted.  A disconnected client has not committed the assistant turn and
+     * must not leave hidden/generated KV state as the authoritative session. */
+    if (j->req.kind == REQ_CHAT && parsed_calls.len) {
+        tool_memory_remember(s, &parsed_calls);
+    }
     if (j->req.api == API_RESPONSES) {
         if (strcmp(final_finish, "error") && strcmp(final_finish, "length")) {
             /* Store the post-turn visible transcript plus the live token
@@ -10852,67 +11087,7 @@ decode_again:
         thinking_live_clear(s);
     }
 
-    if (j->req.stream) {
-        bool response_ok = true;
-        if (j->req.api == API_ANTHROPIC) {
-            response_ok = anthropic_sse_finish_live(j->fd, s, &j->req, id, &anthropic_live,
-                                                    text.ptr ? text.ptr : "", text.len,
-                                                    &parsed_calls, final_finish, completion);
-        } else if (openai_live_chat) {
-            response_ok = openai_sse_finish_live(j->fd, s, &j->req, id, &openai_live,
-                                                 text.ptr ? text.ptr : "", text.len,
-                                                 &parsed_calls, final_finish,
-                                                 prompt_tokens, completion);
-        } else if (responses_live_chat) {
-            /* If parse recovered a malformed tool call back to plain text,
-             * pass parsed_content so the streaming tail can be flushed; in
-             * the normal path parsed_content is the assistant text we already
-             * streamed and the diff is empty. */
-            const char *recover =
-                recovered_tool_parse_failure ? parsed_content : NULL;
-            response_ok = responses_sse_finish_live(j->fd, &j->req, &responses_live,
-                                                    text.ptr ? text.ptr : "", text.len,
-                                                    recover,
-                                                    &parsed_calls, final_finish,
-                                                    prompt_tokens, completion,
-                                                    responses_created_at);
-        } else if (structured_stream) {
-            response_ok = sse_chat_finish(j->fd, &j->req, id,
-                                          parsed_content ? parsed_content : (text.ptr ? text.ptr : ""),
-                                          parsed_reasoning,
-                                          &parsed_calls, final_finish,
-                                          prompt_tokens, completion);
-        } else {
-            response_ok = sse_chunk(j->fd, &j->req, id, NULL, final_finish) &&
-                          sse_done(j->fd, &j->req, id, prompt_tokens, completion);
-        }
-        if (!response_ok) {
-            server_log(DS4_LOG_DEFAULT,
-                       "ds4-server: %s ctx=%s%s%s final stream failed",
-                       j->req.kind == REQ_CHAT ? "chat" : "completion",
-                       ctx_span,
-                       req_flags[0] ? " " : "",
-                       req_flags);
-        }
-    } else if (j->req.api == API_ANTHROPIC) {
-        anthropic_final_response(j->fd, s->enable_cors, &j->req, id,
-                                 parsed_content ? parsed_content : (text.ptr ? text.ptr : ""),
-                                 parsed_reasoning,
-                                 &parsed_calls, final_finish,
-                                 prompt_tokens, completion);
-    } else if (j->req.api == API_RESPONSES) {
-        responses_final_response(j->fd, s->enable_cors, &j->req, id,
-                                 parsed_content ? parsed_content : (text.ptr ? text.ptr : ""),
-                                 parsed_reasoning,
-                                 &parsed_calls, final_finish,
-                                 prompt_tokens, completion);
-    } else {
-        final_response(j->fd, s->enable_cors, &j->req, id,
-                       parsed_content ? parsed_content : (text.ptr ? text.ptr : ""),
-                       parsed_reasoning,
-                       &parsed_calls, final_finish,
-                       prompt_tokens, completion);
-    }
+finish_log:
     if (j->req.kind == REQ_CHAT && j->req.has_tools) {
         char flags[80];
         log_flags(flags, sizeof(flags),
@@ -13465,7 +13640,7 @@ static void test_dsml_repair_produces_parseable_calls(void) {
             DS4_INVOKE_END "\n";
         buf_free(&repaired);
         TEST_ASSERT(try_repair_dsml(broken_after_think, strlen(broken_after_think), &repaired));
-        TEST_ASSERT(parse_generated_message_ex(repaired.ptr, true, &content, &reasoning, &calls));
+        TEST_ASSERT(parse_generated_message_ex(repaired.ptr, true, NULL, NULL, &content, &reasoning, &calls));
         TEST_ASSERT(calls.len == 1);
         TEST_ASSERT(calls.v[0].name && !strcmp(calls.v[0].name, "bash"));
         TEST_ASSERT(strstr(calls.v[0].arguments, "\"command\": \"date\"") != NULL);
@@ -15251,6 +15426,59 @@ static void test_kv_cache_eviction_keeps_smaller_context_prefix(void) {
     unlink(cold_path);
     free(continued_path);
     free(cold_path);
+    rmdir(dir);
+}
+
+static void test_kv_cache_eviction_shields_protected_sha(void) {
+    char tmpl[] = "/tmp/ds4-kv-protected-sha-evict-test.XXXXXX";
+    char *dir = mkdtemp(tmpl);
+    TEST_ASSERT(dir != NULL);
+    if (!dir) return;
+
+    /* The protected entry has the lowest eviction score (fewest tokens), so
+     * without the shield it would be the natural victim. */
+    const char *protected_text = "abort recovery frontier prefix";
+    const char *hot_text = "unrelated stable prefix";
+    test_kv_text_stub_file(dir, protected_text, KV_REASON_COLD, 256, 2048);
+    test_kv_text_stub_file(dir, hot_text, KV_REASON_COLD, 4096, 2048);
+
+    char protected_sha[41], hot_sha[41];
+    sha1_bytes_hex(protected_text, strlen(protected_text), protected_sha);
+    sha1_bytes_hex(hot_text, strlen(hot_text), hot_sha);
+    char protected_name[44], hot_name[44];
+    snprintf(protected_name, sizeof(protected_name), "%.40s.kv", protected_sha);
+    snprintf(hot_name, sizeof(hot_name), "%.40s.kv", hot_sha);
+    char *protected_path = path_join(dir, protected_name);
+    char *hot_path = path_join(dir, hot_name);
+
+    kv_disk_cache kc = {0};
+    kc.enabled = true;
+    kc.dir = xstrdup(dir);
+    kc.opt = kv_cache_default_options();
+    const char *incoming_text = "incoming prompt text";
+    uint64_t incoming_bytes =
+        KV_CACHE_FIXED_HEADER + 4u + strlen(incoming_text) + 2048u;
+    kc.budget_bytes =
+        incoming_bytes + KV_CACHE_FIXED_HEADER + 4u + strlen(protected_text) + 2048u;
+    ds4_kvstore_eviction_context incoming = {
+        .text = incoming_text,
+        .text_len = strlen(incoming_text),
+        .model_id = 0,
+        .quant_bits = 2,
+        .ctx_size = 32768,
+        .reject_different_quant = false,
+        .protected_sha = protected_sha,
+    };
+    kv_cache_evict(&kc, NULL, incoming_bytes, &incoming);
+
+    TEST_ASSERT(access(protected_path, F_OK) == 0);
+    TEST_ASSERT(access(hot_path, F_OK) != 0);
+
+    kv_cache_close(&kc);
+    unlink(protected_path);
+    unlink(hot_path);
+    free(protected_path);
+    free(hot_path);
     rmdir(dir);
 }
 
