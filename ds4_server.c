@@ -9784,17 +9784,35 @@ static bool restore_clean_prompt_frontier(server *s, const request *req,
     int replay_tokens = effective.len - loaded;
     if (replay_tokens < 0) replay_tokens = effective.len;
 
-    /* Do not eagerly replay the old request suffix during abort cleanup.  The
-     * next client request may retokenize or rewrite the last few visible bytes,
-     * causing a second rollback anyway.  Leaving the live session at the clean
-     * disk frontier makes the next request replay the suffix exactly once, via
-     * memory-text or disk-prefix matching, and never trusts aborted decode KV. */
+    /* Abort rollback must leave the live KV at the exact stable prompt frontier
+     * for the aborted request, not merely at an older disk checkpoint.  The next
+     * client request is normally that same prompt plus a new user instruction;
+     * if we stop at the disk prefix, a later request may fail the cheap token
+     * prefix check and cold-prefill a huge transcript.  Replay the clean prompt
+     * suffix now (prompt tokens only, never aborted decode tokens) so the live
+     * session and the visible transcript agree at the last committed boundary. */
+    char sync_err[160] = {0};
+    if (ds4_session_sync(s->session, &effective, sync_err, sizeof(sync_err)) != 0) {
+        ds4_session_invalidate(s->session);
+        s->kv.continued_last_store_tokens = 0;
+        server_log(DS4_LOG_WARNING,
+                   "ds4-server: clean abort checkpoint replay failed ctx=%s request_ctx=%s cached=%d target=%d error=\"%s\" file=%s",
+                   replay_ctx, ctx ? ctx : "?", loaded, effective.len,
+                   sync_err, path ? path : "");
+        trace_event(s, trace_id,
+                    "clean abort checkpoint replay failed: cached=%d target=%d error=%s file=%s",
+                    loaded, effective.len, sync_err, path ? path : "");
+        ds4_tokens_free(&effective);
+        free(path);
+        return false;
+    }
+
     server_log(DS4_LOG_KVCACHE,
-               "ds4-server: clean abort checkpoint restored ctx=%s request_ctx=%s deferred_replay=%d target=%d file=%s",
-               replay_ctx, ctx ? ctx : "?", replay_tokens,
+               "ds4-server: clean abort prompt frontier restored ctx=%s request_ctx=%s cached=%d replayed=%d target=%d file=%s",
+               replay_ctx, ctx ? ctx : "?", loaded, replay_tokens,
                effective.len, path ? path : "");
     trace_event(s, trace_id,
-                "clean abort checkpoint restored: cached=%d deferred_replay=%d target=%d file=%s",
+                "clean abort prompt frontier restored: cached=%d replayed=%d target=%d file=%s",
                 loaded, replay_tokens, effective.len, path ? path : "");
     ds4_tokens_free(&effective);
     free(path);
