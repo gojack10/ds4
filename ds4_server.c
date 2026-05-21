@@ -535,6 +535,9 @@ typedef struct {
      * happens to be named "tool_search". */
     bool responses_tool_search;
     char **prop;
+    /* JSON Schema "type" for each prop ("string","number","integer","boolean",
+     * "array","object","null"), or NULL when unknown.  Parallel to prop[]. */
+    char **prop_type;
     int len;
     int cap;
 } tool_schema_order;
@@ -698,8 +701,12 @@ static void tool_schema_order_free(tool_schema_order *o) {
     free(o->name);
     free(o->wire_name);
     free(o->namespace);
-    for (int i = 0; i < o->len; i++) free(o->prop[i]);
+    for (int i = 0; i < o->len; i++) {
+        free(o->prop[i]);
+        if (o->prop_type) free(o->prop_type[i]);
+    }
     free(o->prop);
+    free(o->prop_type);
     memset(o, 0, sizeof(*o));
 }
 
@@ -709,12 +716,15 @@ static void tool_schema_orders_free(tool_schema_orders *orders) {
     memset(orders, 0, sizeof(*orders));
 }
 
-static void tool_schema_order_prop_push(tool_schema_order *o, char *prop) {
+static void tool_schema_order_prop_push(tool_schema_order *o, char *prop, char *type) {
     if (o->len == o->cap) {
         o->cap = o->cap ? o->cap * 2 : 8;
         o->prop = xrealloc(o->prop, (size_t)o->cap * sizeof(o->prop[0]));
+        o->prop_type = xrealloc(o->prop_type, (size_t)o->cap * sizeof(o->prop_type[0]));
     }
-    o->prop[o->len++] = prop;
+    o->prop[o->len] = prop;
+    o->prop_type[o->len] = type;
+    o->len++;
 }
 
 static int tool_schema_orders_find_index(const tool_schema_orders *orders, const char *name) {
@@ -742,6 +752,24 @@ static void tool_schema_orders_push(tool_schema_orders *orders, tool_schema_orde
 static const tool_schema_order *tool_schema_orders_find(const tool_schema_orders *orders, const char *name) {
     int idx = tool_schema_orders_find_index(orders, name);
     return idx >= 0 ? &orders->v[idx] : NULL;
+}
+
+/* Look up the JSON Schema "type" string for a single tool parameter.
+ * Returns NULL if the schema is missing the tool, the param, or the type field
+ * (e.g. a union-typed param via "anyOf").  Callers must treat NULL as "no
+ * coercion hint available" rather than as "string". */
+static const char *tool_schema_orders_find_prop_type(const tool_schema_orders *orders,
+                                                     const char *tool_name,
+                                                     const char *param_name) {
+    if (!orders || !tool_name || !param_name) return NULL;
+    int idx = tool_schema_orders_find_index(orders, tool_name);
+    if (idx < 0) return NULL;
+    const tool_schema_order *o = &orders->v[idx];
+    if (!o->prop_type) return NULL;
+    for (int i = 0; i < o->len; i++) {
+        if (o->prop[i] && !strcmp(o->prop[i], param_name)) return o->prop_type[i];
+    }
+    return NULL;
 }
 
 static void request_init(request *r, req_kind kind, int max_tokens) {
@@ -1352,6 +1380,44 @@ done:
     return out;
 }
 
+/* Pull the JSON Schema "type" field out of a property definition body like
+ * {"type":"number","description":"..."}.  Returns a freshly-allocated string or
+ * NULL when the body is not an object, has no "type", or "type" is non-string
+ * (e.g. an array for unions).  We do not normalize: callers compare against the
+ * canonical lowercase JSON Schema keywords. */
+static char *parse_schema_property_type(const char *json) {
+    if (!json) return NULL;
+    const char *p = json;
+    json_ws(&p);
+    if (*p != '{') return NULL;
+    p++;
+    json_ws(&p);
+    while (*p && *p != '}') {
+        char *key = NULL;
+        if (!json_string(&p, &key)) return NULL;
+        json_ws(&p);
+        if (*p != ':') {
+            free(key);
+            return NULL;
+        }
+        p++;
+        if (!strcmp(key, "type")) {
+            free(key);
+            json_ws(&p);
+            if (*p != '"') return NULL;
+            char *type = NULL;
+            if (!json_string(&p, &type)) return NULL;
+            return type;
+        }
+        free(key);
+        if (!json_skip_value(&p)) return NULL;
+        json_ws(&p);
+        if (*p == ',') p++;
+        json_ws(&p);
+    }
+    return NULL;
+}
+
 static bool parse_schema_properties(const char *json, tool_schema_order *order) {
     const char *p = json;
     json_ws(&p);
@@ -1382,8 +1448,14 @@ static bool parse_schema_properties(const char *json, tool_schema_order *order) 
                     return false;
                 }
                 p++;
-                tool_schema_order_prop_push(order, prop);
-                if (!json_skip_value(&p)) return false;
+                char *body = NULL;
+                if (!json_raw_value(&p, &body)) {
+                    free(prop);
+                    return false;
+                }
+                char *type = parse_schema_property_type(body);
+                free(body);
+                tool_schema_order_prop_push(order, prop, type);
                 json_ws(&p);
                 if (*p == ',') p++;
                 json_ws(&p);
@@ -4321,11 +4393,83 @@ static char *dsml_attr(const char *tag, const char *name) {
     return decoded;
 }
 
-static void tool_call_json_args_add(buf *args, const char *name, const char *value, const char *is_string) {
+/* Is the value (trimmed of surrounding ASCII whitespace) a syntactically valid
+ * JSON number and nothing else?  Strict by design: must consume the whole
+ * value, no trailing characters, no NaN/Infinity, no leading "+".  This lets
+ * the caller safely splice the original bytes into the emitted JSON. */
+static bool dsml_value_is_json_number(const char *s) {
+    if (!s) return false;
+    while (*s == ' ' || *s == '\t' || *s == '\r' || *s == '\n') s++;
+    const char *start = s;
+    if (*s == '-') s++;
+    if (*s == '0') {
+        s++;
+    } else if (*s >= '1' && *s <= '9') {
+        while (*s >= '0' && *s <= '9') s++;
+    } else {
+        return false;
+    }
+    if (*s == '.') {
+        s++;
+        if (!(*s >= '0' && *s <= '9')) return false;
+        while (*s >= '0' && *s <= '9') s++;
+    }
+    if (*s == 'e' || *s == 'E') {
+        s++;
+        if (*s == '+' || *s == '-') s++;
+        if (!(*s >= '0' && *s <= '9')) return false;
+        while (*s >= '0' && *s <= '9') s++;
+    }
+    if (s == start) return false;
+    while (*s == ' ' || *s == '\t' || *s == '\r' || *s == '\n') s++;
+    return *s == '\0';
+}
+
+/* Trim surrounding ASCII whitespace and copy.  Returned pointer must be freed. */
+static char *dsml_value_trimmed_copy(const char *s) {
+    if (!s) return xstrdup("");
+    while (*s == ' ' || *s == '\t' || *s == '\r' || *s == '\n') s++;
+    size_t n = strlen(s);
+    while (n > 0 && (s[n - 1] == ' ' || s[n - 1] == '\t' ||
+                     s[n - 1] == '\r' || s[n - 1] == '\n'))
+        n--;
+    return xstrndup(s, n);
+}
+
+/* Emit one DSML-derived argument as JSON.
+ *
+ * Coercion: the model is supposed to set string="true|false" to indicate JSON
+ * type, but in practice it frequently emits string="true" for numeric values
+ * (e.g. `name="limit" string="true">15`).  When the caller has the tool's JSON
+ * Schema for this param and the schema declares number/integer/boolean, we
+ * coerce the value to that JSON type as long as the literal still parses.
+ * Without a schema we fall back to the model's stated type so we never break
+ * legitimately-string params that happen to look like numbers. */
+static void tool_call_json_args_add(buf *args, const char *name, const char *value,
+                                    const char *is_string, const char *schema_type) {
     if (args->len) buf_puts(args, ", ");
     json_escape(args, name ? name : "");
     buf_puts(args, ": ");
-    if (is_string && !strcmp(is_string, "true")) {
+    bool model_says_string = is_string && !strcmp(is_string, "true");
+    if (model_says_string && schema_type && value) {
+        if (!strcmp(schema_type, "number") || !strcmp(schema_type, "integer")) {
+            if (dsml_value_is_json_number(value)) {
+                char *trimmed = dsml_value_trimmed_copy(value);
+                buf_puts(args, trimmed);
+                free(trimmed);
+                return;
+            }
+        } else if (!strcmp(schema_type, "boolean")) {
+            char *trimmed = dsml_value_trimmed_copy(value);
+            if (!strcmp(trimmed, "true") || !strcmp(trimmed, "false")) {
+                buf_puts(args, trimmed);
+                free(trimmed);
+                return;
+            }
+            free(trimmed);
+        }
+    }
+    if (model_says_string) {
         json_escape(args, value ? value : "");
     } else {
         char *min = json_minify_raw_value(value ? value : "null");
@@ -4374,7 +4518,10 @@ static bool dsml_parse_leaf_param_json(const char **p_in, const char *param_star
     const char *type = is_string ? is_string : "true";
     char *value = !strcmp(type, "true") ?
         dsml_unescape_text(raw_value) : xstrdup(raw_value);
-    tool_call_json_args_add(out, name, value, type);
+    /* Nested params live one level below the schema's object/array type, so a
+     * direct prop-name lookup against the top-level schema does not apply.
+     * Coercion is skipped here; the outer leaf path handles the common case. */
+    tool_call_json_args_add(out, name, value, type, NULL);
 
     free(name);
     free(is_string);
@@ -4432,6 +4579,7 @@ static void split_reasoning_content(const char *text, size_t n, char **content_o
 }
 
 static bool parse_generated_message_ex(const char *text, bool require_thinking_closed,
+                                       const tool_schema_orders *orders,
                                        char **content_out, char **reasoning_out,
                                        tool_calls *calls) {
     text = text ? text : "";
@@ -4570,7 +4718,7 @@ static bool parse_generated_message_ex(const char *text, bool require_thinking_c
                 }
                 tool_call_json_args_add(&args, param_name,
                                         nested.ptr ? nested.ptr : "{}",
-                                        "false");
+                                        "false", NULL);
                 buf_free(&nested);
                 p = skip_ascii_ws(nested_p);
                 if (!strncmp(p, param_end, strlen(param_end))) {
@@ -4591,7 +4739,9 @@ static bool parse_generated_message_ex(const char *text, bool require_thinking_c
             const char *type = param_is_string ? param_is_string : "true";
             char *value = !strcmp(type, "true") ?
                 dsml_unescape_text(raw_value) : xstrdup(raw_value);
-            tool_call_json_args_add(&args, param_name, value, type);
+            const char *schema_type =
+                tool_schema_orders_find_prop_type(orders, name, param_name);
+            tool_call_json_args_add(&args, param_name, value, type, schema_type);
             free(param_name);
             free(param_is_string);
             free(raw_value);
@@ -4688,6 +4838,7 @@ static bool parse_generated_message_for_response(const char *text,
                                                  bool has_tools,
                                                  bool saw_tool_start,
                                                  bool require_thinking_closed,
+                                                 const tool_schema_orders *orders,
                                                  const char **finish_io,
                                                  char *err,
                                                  size_t errlen,
@@ -4699,6 +4850,7 @@ static bool parse_generated_message_for_response(const char *text,
 
     bool parsed_ok = parse_generated_message_ex(text ? text : "",
                                                 require_thinking_closed,
+                                                orders,
                                                 content_out, reasoning_out,
                                                 calls);
     if (parsed_ok) return true;
@@ -10801,7 +10953,12 @@ decode_again:
             tool_calls test_calls = {0};
             char *test_content = NULL;
             char *test_reasoning = NULL;
-            bool repair_ok = parse_generated_message_ex(repaired.ptr, false, &test_content, &test_reasoning, &test_calls);
+            bool repair_ok = parse_generated_message_ex(repaired.ptr, false,
+                                                        &j->req.tool_orders,
+                                                        NULL,
+                                                        &test_content,
+                                                        &test_reasoning,
+                                                        &test_calls);
             free(test_content);
             free(test_reasoning);
             if (repair_ok && test_calls.len > 0) {
@@ -10896,6 +11053,7 @@ decode_again:
             j->req.has_tools,
             saw_tool_start,
             ds4_think_mode_enabled(j->req.think_mode),
+            &j->req.tool_orders,
             &final_finish,
             err,
             sizeof(err),
@@ -12561,7 +12719,7 @@ static void test_anthropic_tool_stream_sends_live_tool_use(void) {
     char *parsed_content = NULL;
     char *parsed_reasoning = NULL;
     tool_calls calls = {0};
-    TEST_ASSERT(parse_generated_message_ex(raw_complete, false, &parsed_content,
+    TEST_ASSERT(parse_generated_message_ex(raw_complete, false, NULL, &parsed_content,
                                            &parsed_reasoning, &calls));
     TEST_ASSERT(calls.len == 1);
     apply_anthropic_stream_tool_ids(&calls, &st);
@@ -12898,7 +13056,7 @@ static void test_openai_tool_stream_sends_partial_arguments(void) {
     char *parsed_content = NULL;
     char *parsed_reasoning = NULL;
     tool_calls calls = {0};
-    TEST_ASSERT(parse_generated_message_ex(raw_complete, false, &parsed_content, &parsed_reasoning, &calls));
+    TEST_ASSERT(parse_generated_message_ex(raw_complete, false, NULL, &parsed_content, &parsed_reasoning, &calls));
     TEST_ASSERT(calls.len == 1);
     apply_openai_stream_tool_ids(&calls, &st);
     TEST_ASSERT(calls.v[0].id != NULL);
@@ -13444,7 +13602,7 @@ static void test_parse_short_dsml_and_canonical_suffix(void) {
     char *content = NULL;
     char *reasoning = NULL;
     tool_calls calls = {0};
-    TEST_ASSERT(parse_generated_message_ex(generated, false, &content, &reasoning, &calls));
+    TEST_ASSERT(parse_generated_message_ex(generated, false, NULL, &content, &reasoning, &calls));
     TEST_ASSERT(reasoning && !strcmp(reasoning, "need a tool"));
     TEST_ASSERT(content && content[0] == '\0');
     TEST_ASSERT(calls.len == 1);
@@ -13484,7 +13642,7 @@ static void test_dsml_parser_recovers_loose_nested_parameters(void) {
     char *content = NULL;
     char *reasoning = NULL;
     tool_calls calls = {0};
-    TEST_ASSERT(parse_generated_message_ex(generated, false, &content, &reasoning, &calls));
+    TEST_ASSERT(parse_generated_message_ex(generated, false, NULL, &content, &reasoning, &calls));
     TEST_ASSERT(content && !strcmp(content, "review done"));
     TEST_ASSERT(calls.len == 1);
     TEST_ASSERT(calls.v[0].name && !strcmp(calls.v[0].name, "edit"));
@@ -13520,7 +13678,7 @@ static void test_dsml_repair_produces_parseable_calls(void) {
 
         buf_free(&repaired);
         TEST_ASSERT(try_repair_dsml(broken, strlen(broken), &repaired));
-        TEST_ASSERT(parse_generated_message_ex(repaired.ptr, false, &content, &reasoning, &calls));
+        TEST_ASSERT(parse_generated_message_ex(repaired.ptr, false, NULL, NULL, &content, &reasoning, &calls));
         TEST_ASSERT(calls.len == 1);
         TEST_ASSERT(calls.v[0].name && !strcmp(calls.v[0].name, "bash"));
         TEST_ASSERT(strstr(calls.v[0].arguments, "\"command\": \"ls -la\"") != NULL);
@@ -13538,7 +13696,7 @@ static void test_dsml_repair_produces_parseable_calls(void) {
 
         buf_free(&repaired);
         TEST_ASSERT(try_repair_dsml(broken, strlen(broken), &repaired));
-        TEST_ASSERT(parse_generated_message_ex(repaired.ptr, false, &content, &reasoning, &calls));
+        TEST_ASSERT(parse_generated_message_ex(repaired.ptr, false, NULL, NULL, &content, &reasoning, &calls));
         TEST_ASSERT(calls.len == 1);
         TEST_ASSERT(calls.v[0].name && !strcmp(calls.v[0].name, "edit"));
         TEST_ASSERT(strstr(calls.v[0].arguments, "\"path\": \"/tmp/test.c\"") != NULL);
@@ -13556,7 +13714,7 @@ static void test_dsml_repair_produces_parseable_calls(void) {
 
         buf_free(&repaired);
         TEST_ASSERT(try_repair_dsml(broken, strlen(broken), &repaired));
-        TEST_ASSERT(parse_generated_message_ex(repaired.ptr, false, &content, &reasoning, &calls));
+        TEST_ASSERT(parse_generated_message_ex(repaired.ptr, false, NULL, NULL, &content, &reasoning, &calls));
         TEST_ASSERT(calls.len == 1);
         TEST_ASSERT(calls.v[0].name && !strcmp(calls.v[0].name, "bash"));
         TEST_ASSERT(strstr(calls.v[0].arguments, "\"command\": \"echo hello\"") != NULL);
@@ -13576,7 +13734,7 @@ static void test_dsml_repair_produces_parseable_calls(void) {
 
         buf_free(&repaired);
         TEST_ASSERT(try_repair_dsml(broken, strlen(broken), &repaired));
-        TEST_ASSERT(parse_generated_message_ex(repaired.ptr, false, &content, &reasoning, &calls));
+        TEST_ASSERT(parse_generated_message_ex(repaired.ptr, false, NULL, NULL, &content, &reasoning, &calls));
         TEST_ASSERT(calls.len == 1);
         TEST_ASSERT(calls.v[0].name && !strcmp(calls.v[0].name, "write_file"));
         TEST_ASSERT(strstr(calls.v[0].arguments, "\"path\": \"/tmp/out.txt\"") != NULL);
@@ -13596,7 +13754,7 @@ static void test_dsml_repair_produces_parseable_calls(void) {
 
         buf_free(&repaired);
         TEST_ASSERT(try_repair_dsml(broken, strlen(broken), &repaired));
-        TEST_ASSERT(parse_generated_message_ex(repaired.ptr, false, &content, &reasoning, &calls));
+        TEST_ASSERT(parse_generated_message_ex(repaired.ptr, false, NULL, NULL, &content, &reasoning, &calls));
         TEST_ASSERT(calls.len == 1);
         TEST_ASSERT(calls.v[0].name && !strcmp(calls.v[0].name, "execute_command"));
         TEST_ASSERT(strstr(calls.v[0].arguments, "\"command\": \"pwd\"") != NULL);
@@ -13723,6 +13881,7 @@ static void test_tool_parse_failure_returns_recoverable_finish(void) {
                                                        true,
                                                        true,
                                                        false,
+                                                       NULL,
                                                        &finish,
                                                        err,
                                                        sizeof(err),
@@ -13777,7 +13936,7 @@ static void test_thinking_dsml_is_not_executable_before_think_close(void) {
     char *content = NULL;
     char *reasoning = NULL;
     tool_calls calls = {0};
-    TEST_ASSERT(parse_generated_message_ex(generated, true,
+    TEST_ASSERT(parse_generated_message_ex(generated, true, NULL,
                                            &content, &reasoning, &calls));
     TEST_ASSERT(calls.len == 0);
     TEST_ASSERT(reasoning && strstr(reasoning, DS4_TOOL_CALLS_START) != NULL);
@@ -13800,7 +13959,7 @@ static void test_thinking_dsml_after_think_close_is_executable(void) {
     char *content = NULL;
     char *reasoning = NULL;
     tool_calls calls = {0};
-    TEST_ASSERT(parse_generated_message_ex(generated, true,
+    TEST_ASSERT(parse_generated_message_ex(generated, true, NULL,
                                            &content, &reasoning, &calls));
     TEST_ASSERT(calls.len == 1);
     TEST_ASSERT(reasoning && !strcmp(reasoning, "need a shell check"));
@@ -13838,7 +13997,7 @@ static void test_tool_checkpoint_suffix_is_future_prompt_canonical(void) {
     char *content = NULL;
     char *reasoning = NULL;
     tool_calls calls = {0};
-    TEST_ASSERT(parse_generated_message_ex(generated, false, &content, &reasoning, &calls));
+    TEST_ASSERT(parse_generated_message_ex(generated, false, NULL, &content, &reasoning, &calls));
     TEST_ASSERT(calls.len == 1);
     TEST_ASSERT(strstr(calls.v[0].arguments, "cd /tmp && git diff 2>/dev/null") != NULL);
     TEST_ASSERT(strstr(calls.v[0].arguments, "&amp;&amp;") == NULL);
@@ -13917,7 +14076,7 @@ static void test_tool_checkpoint_minifies_json_parameters(void) {
     char *content = NULL;
     char *reasoning = NULL;
     tool_calls calls = {0};
-    TEST_ASSERT(parse_generated_message_ex(generated, false, &content, &reasoning, &calls));
+    TEST_ASSERT(parse_generated_message_ex(generated, false, NULL, &content, &reasoning, &calls));
     TEST_ASSERT(calls.len == 1);
 
     request r;
@@ -13974,7 +14133,7 @@ static void test_tool_memory_replays_sampled_dsml(void) {
     char *content = NULL;
     char *reasoning = NULL;
     tool_calls sampled = {0};
-    TEST_ASSERT(parse_generated_message_ex(generated, false, &content, &reasoning, &sampled));
+    TEST_ASSERT(parse_generated_message_ex(generated, false, NULL, &content, &reasoning, &sampled));
     TEST_ASSERT(sampled.len == 1);
 
     server s;
@@ -14584,7 +14743,7 @@ static void test_tool_separator_whitespace_is_not_content(void) {
     char *content = NULL;
     char *reasoning = NULL;
     tool_calls calls = {0};
-    TEST_ASSERT(parse_generated_message_ex(generated, false, &content, &reasoning, &calls));
+    TEST_ASSERT(parse_generated_message_ex(generated, false, NULL, &content, &reasoning, &calls));
     TEST_ASSERT(reasoning && !strcmp(reasoning, "need a tool"));
     TEST_ASSERT(content && !strcmp(content, "I will inspect the files."));
     TEST_ASSERT(calls.len == 1);
@@ -15988,6 +16147,7 @@ static void ds4_server_unit_tests_run(void) {
     test_kv_cache_eviction_ignores_oversize_incoming();
     test_kv_cache_eviction_prefers_superseded_continued_prefix();
     test_kv_cache_eviction_keeps_smaller_context_prefix();
+    test_kv_cache_eviction_shields_protected_sha();
     test_kv_cache_eviction_score_decays_stale_hits();
     test_kv_cache_eviction_decayed_hits_tie_break_by_age();
     test_kv_cache_eviction_keeps_aligned_continued_frontiers();

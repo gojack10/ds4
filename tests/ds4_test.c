@@ -1777,7 +1777,7 @@ static void test_tool_call_quality_one(bool quality) {
     char *reasoning = NULL;
     tool_calls calls = {0};
     bool parsed = parse_generated_message_ex(text.ptr ? text.ptr : "",
-                                             false, &content, &reasoning, &calls);
+                                             false, NULL, &content, &reasoning, &calls);
     TEST_ASSERT(decode_ok);
     TEST_ASSERT(parsed);
     TEST_ASSERT(calls.len > 0);
