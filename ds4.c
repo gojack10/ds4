@@ -22224,6 +22224,7 @@ struct ds4_session {
     int ctx_size;
     bool checkpoint_valid;
     bool mtp_draft_valid;
+    volatile bool cancel_requested;
 };
 
 /* =========================================================================
@@ -25085,8 +25086,27 @@ void ds4_session_set_cancel(ds4_session *s, ds4_session_cancel_fn fn, void *ud) 
     s->cancel_ud = ud;
 }
 
+void ds4_session_request_cancel(ds4_session *s) {
+    if (!s) return;
+    s->cancel_requested = true;
+}
+
+void ds4_session_clear_cancel(ds4_session *s) {
+    if (!s) return;
+    s->cancel_requested = false;
+}
+
+bool ds4_session_cancel_requested(const ds4_session *s) {
+    return s && s->cancel_requested;
+}
+
+/* A session is considered cancelled either by the registered cancel callback
+ * (interactive interruption, e.g. ds4-agent Ctrl-C) or by the asynchronous
+ * cancel_requested flag (e.g. ds4-server detecting a client disconnect
+ * mid-prefill).  Both ride the same poll points in the prefill loops. */
 static bool ds4_session_cancelled(ds4_session *s) {
-    return s && s->cancel && s->cancel(s->cancel_ud);
+    return s && (s->cancel_requested ||
+                 (s->cancel && s->cancel(s->cancel_ud)));
 }
 
 static bool ds4_session_cancelled_cb(void *ud) {
@@ -25640,7 +25660,11 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
                 return DS4_SESSION_SYNC_INTERRUPTED;
             }
             if (!ok) {
-                snprintf(err, errlen, "%s resumed prefill failed while extending checkpoint", backend_name);
+                if (s->cancel_requested) {
+                    snprintf(err, errlen, "prefill cancelled");
+                } else {
+                    snprintf(err, errlen, "%s resumed prefill failed while extending checkpoint", backend_name);
+                }
                 s->checkpoint_valid = false;
                 return 1;
             }
@@ -25715,7 +25739,11 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
         }
     }
     if (!ok) {
-        snprintf(err, errlen, "%s prefill failed", backend_name);
+        if (s->cancel_requested) {
+            snprintf(err, errlen, "prefill cancelled");
+        } else {
+            snprintf(err, errlen, "%s prefill failed", backend_name);
+        }
         s->checkpoint_valid = false;
         return 1;
     }

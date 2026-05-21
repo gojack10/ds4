@@ -9401,6 +9401,10 @@ typedef struct {
     bool headers_sent;
     bool stream_failed;
     double last_keepalive;
+    /* Cooperative cancellation: peek the same fd at chunk boundaries to detect
+     * client disconnect mid-prefill. cancelled is sticky once we see EOF so we
+     * don't keep polling a dead socket. */
+    bool cancelled;
 } server_prefill_progress;
 
 static void request_ctx_span(char *buf, size_t len, int cached, int prompt) {
@@ -9701,6 +9705,31 @@ static void server_progress_cb(void *ud, const char *event, int current, int tot
                elapsed);
     if (p->srv && current > p->cached_tokens) {
         kv_cache_maybe_store_continued(p->srv);
+    }
+
+    /* Disconnect detection: peek the client socket without consuming bytes.
+     * recv() returns 0 on a half-closed connection (FIN from the proxy after pi
+     * cancelled), so we can stop the prefill at the next chunk boundary instead
+     * of running to completion and discovering the dead connection only on the
+     * first SSE write.  POLLIN is set both on data and on EOF; the recv peek
+     * distinguishes the two.  EAGAIN means the connection is healthy and idle. */
+    if (p->srv && p->fd >= 0 && !p->cancelled) {
+        struct pollfd pfd = { .fd = p->fd, .events = POLLIN };
+        if (poll(&pfd, 1, 0) > 0 && (pfd.revents & (POLLIN | POLLHUP | POLLERR | POLLNVAL))) {
+            char probe;
+            ssize_t n = recv(p->fd, &probe, 1, MSG_PEEK | MSG_DONTWAIT);
+            if (n == 0 || (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK)) {
+                p->cancelled = true;
+                ds4_session_request_cancel(p->srv->session);
+                server_log(DS4_LOG_PREFILL,
+                           "ds4-server: %s ctx=%s%s%s prefill cancel requested: client disconnected at %d/%d",
+                           p->kind == REQ_CHAT ? "chat" : "completion",
+                           p->ctx,
+                           flags[0] ? " " : "",
+                           flags,
+                           display_current, display_total);
+            }
+        }
     }
 }
 
@@ -10085,6 +10114,10 @@ static bool should_canonicalize_tool_checkpoint(const server *s, const tool_call
 static void generate_job(server *s, job *j) {
     char err[160];
     err[0] = '\0';
+    /* New request: clear any cancel flag left over from a prior aborted run.
+     * The progress callback may set it again during prefill if the client
+     * disconnects. */
+    ds4_session_clear_cancel(s->session);
     const int old_pos = ds4_session_pos(s->session);
     const int common = ds4_session_common_prefix(s->session, &j->req.prompt);
     trace_cache_diag cache_diag = {0};
@@ -10360,6 +10393,19 @@ static void generate_job(server *s, job *j) {
         ds4_session_set_display_progress(s->session, NULL, NULL);
         kv_cache_restore_suppressed_continued(&s->kv, suppressed_continued_last,
                                               cold_store_len);
+        if (ds4_session_cancel_requested(s->session)) {
+            /* Client vanished mid-prefill.  The loaded disk entry (if any)
+             * is fine - the prefill was interrupted, not corrupted - so keep
+             * it for abort recovery.  Recover the live KV to the most recent
+             * clean checkpoint so the next request can extend instead of
+             * cold-prefilling, and skip the http_error since the socket is
+             * already dead. */
+            free(disk_cache_path);
+            restore_clean_prompt_frontier(s, &j->req, prompt_for_sync, ctx_span,
+                                          trace_id, "client disconnected mid-prefill");
+            trace_event(s, trace_id, "prefill cancelled by client disconnect");
+            return;
+        }
         kv_cache_discard_failed_disk_entry(s, disk_cache_path);
         free(disk_cache_path);
         trace_event(s, trace_id, "prefill failed: %s", err);

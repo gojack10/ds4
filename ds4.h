@@ -235,6 +235,17 @@ void ds4_session_report_progress(ds4_session *s, const char *event, int current,
  * available, 0 when it is still incomplete, and -1 for a local API error. */
 int ds4_session_distributed_route_ready(ds4_session *s, char *err, size_t errlen);
 
+/* Cooperative cancellation for in-flight prefill.  ds4_session_sync() reads the
+ * flag at every chunk boundary (and between CPU-path tokens); the progress
+ * callback or any other thread can set it via ds4_session_request_cancel().
+ * On cancel, sync returns non-zero and the session checkpoint is left
+ * invalidated for the caller to recover (e.g. restore_clean_prompt_frontier).
+ * The flag is cleared by ds4_session_clear_cancel(); callers should clear at
+ * the start of each request. */
+void ds4_session_request_cancel(ds4_session *s);
+void ds4_session_clear_cancel(ds4_session *s);
+bool ds4_session_cancel_requested(const ds4_session *s);
+
 typedef enum {
     DS4_SESSION_REWRITE_ERROR = -1,
     DS4_SESSION_REWRITE_OK = 0,
