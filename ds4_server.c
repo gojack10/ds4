@@ -4436,6 +4436,66 @@ static char *dsml_value_trimmed_copy(const char *s) {
     return xstrndup(s, n);
 }
 
+/* Per-call diagnostics from DSML argument emission.  All fields are optional
+ * on the parser path: callers that pass NULL get the current silent-coerce
+ * behavior.  When non-NULL:
+ *   coerced - comma-separated "tool.param=>type" of each coerced arg (logged)
+ *   rejected - first uncoercible argument as a model-readable sentence
+ *              (e.g. "parameter 'limit' on tool 'read' must be a number, got
+ *              "hello""), used to refuse the call and tell the model why. */
+typedef struct {
+    buf coerced;
+    buf rejected;
+} tool_arg_diag;
+
+static void tool_arg_diag_free(tool_arg_diag *d) {
+    if (!d) return;
+    buf_free(&d->coerced);
+    buf_free(&d->rejected);
+}
+
+static void tool_arg_diag_note_coerced(tool_arg_diag *d, const char *tool,
+                                       const char *param, const char *type) {
+    if (!d) return;
+    if (d->coerced.len) buf_puts(&d->coerced, ", ");
+    buf_puts(&d->coerced, tool ? tool : "?");
+    buf_putc(&d->coerced, '.');
+    buf_puts(&d->coerced, param ? param : "?");
+    buf_puts(&d->coerced, "=>");
+    buf_puts(&d->coerced, type ? type : "?");
+}
+
+static void tool_arg_diag_note_rejected(tool_arg_diag *d, const char *tool,
+                                        const char *param, const char *type,
+                                        const char *value) {
+    /* Keep only the first rejection: one clear message is more useful to the
+     * model than a wall of conflicting complaints, and the model has to fix
+     * the call wholesale before any later issue matters. */
+    if (!d || d->rejected.len) return;
+    buf_puts(&d->rejected, "Tool call rejected: parameter '");
+    buf_puts(&d->rejected, param ? param : "?");
+    buf_puts(&d->rejected, "' on tool '");
+    buf_puts(&d->rejected, tool ? tool : "?");
+    buf_puts(&d->rejected, "' must be a ");
+    buf_puts(&d->rejected, type ? type : "?");
+    buf_puts(&d->rejected, ", but the value ");
+    buf_putc(&d->rejected, '"');
+    /* Truncate long values to keep the synthetic note compact.  120 chars is
+     * long enough to spot the offender, short enough not to balloon prompts. */
+    const char *v = value ? value : "";
+    size_t vn = strlen(v);
+    if (vn > 120) {
+        buf_append(&d->rejected, v, 120);
+        buf_puts(&d->rejected, "...");
+    } else {
+        buf_puts(&d->rejected, v);
+    }
+    buf_putc(&d->rejected, '"');
+    buf_puts(&d->rejected, " is not a valid ");
+    buf_puts(&d->rejected, type ? type : "?");
+    buf_puts(&d->rejected, ". Re-emit the tool call with the correct type.");
+}
+
 /* Emit one DSML-derived argument as JSON.
  *
  * Coercion: the model is supposed to set string="true|false" to indicate JSON
@@ -4444,9 +4504,13 @@ static char *dsml_value_trimmed_copy(const char *s) {
  * Schema for this param and the schema declares number/integer/boolean, we
  * coerce the value to that JSON type as long as the literal still parses.
  * Without a schema we fall back to the model's stated type so we never break
- * legitimately-string params that happen to look like numbers. */
-static void tool_call_json_args_add(buf *args, const char *name, const char *value,
-                                    const char *is_string, const char *schema_type) {
+ * legitimately-string params that happen to look like numbers.
+ *
+ * tool_name is used only to populate diag messages so the caller can log or
+ * tell the model exactly which call was wrong.  diag may be NULL. */
+static void tool_call_json_args_add(buf *args, const char *tool_name, const char *name,
+                                    const char *value, const char *is_string,
+                                    const char *schema_type, tool_arg_diag *diag) {
     if (args->len) buf_puts(args, ", ");
     json_escape(args, name ? name : "");
     buf_puts(args, ": ");
@@ -4457,16 +4521,20 @@ static void tool_call_json_args_add(buf *args, const char *name, const char *val
                 char *trimmed = dsml_value_trimmed_copy(value);
                 buf_puts(args, trimmed);
                 free(trimmed);
+                tool_arg_diag_note_coerced(diag, tool_name, name, schema_type);
                 return;
             }
+            tool_arg_diag_note_rejected(diag, tool_name, name, schema_type, value);
         } else if (!strcmp(schema_type, "boolean")) {
             char *trimmed = dsml_value_trimmed_copy(value);
             if (!strcmp(trimmed, "true") || !strcmp(trimmed, "false")) {
                 buf_puts(args, trimmed);
                 free(trimmed);
+                tool_arg_diag_note_coerced(diag, tool_name, name, schema_type);
                 return;
             }
             free(trimmed);
+            tool_arg_diag_note_rejected(diag, tool_name, name, schema_type, value);
         }
     }
     if (model_says_string) {
@@ -4521,7 +4589,7 @@ static bool dsml_parse_leaf_param_json(const char **p_in, const char *param_star
     /* Nested params live one level below the schema's object/array type, so a
      * direct prop-name lookup against the top-level schema does not apply.
      * Coercion is skipped here; the outer leaf path handles the common case. */
-    tool_call_json_args_add(out, name, value, type, NULL);
+    tool_call_json_args_add(out, NULL, name, value, type, NULL, NULL);
 
     free(name);
     free(is_string);
@@ -4580,6 +4648,7 @@ static void split_reasoning_content(const char *text, size_t n, char **content_o
 
 static bool parse_generated_message_ex(const char *text, bool require_thinking_closed,
                                        const tool_schema_orders *orders,
+                                       tool_arg_diag *diag,
                                        char **content_out, char **reasoning_out,
                                        tool_calls *calls) {
     text = text ? text : "";
@@ -4716,9 +4785,9 @@ static bool parse_generated_message_ex(const char *text, bool require_thinking_c
                     buf_free(&args);
                     return false;
                 }
-                tool_call_json_args_add(&args, param_name,
+                tool_call_json_args_add(&args, name, param_name,
                                         nested.ptr ? nested.ptr : "{}",
-                                        "false", NULL);
+                                        "false", NULL, NULL);
                 buf_free(&nested);
                 p = skip_ascii_ws(nested_p);
                 if (!strncmp(p, param_end, strlen(param_end))) {
@@ -4741,7 +4810,7 @@ static bool parse_generated_message_ex(const char *text, bool require_thinking_c
                 dsml_unescape_text(raw_value) : xstrdup(raw_value);
             const char *schema_type =
                 tool_schema_orders_find_prop_type(orders, name, param_name);
-            tool_call_json_args_add(&args, param_name, value, type, schema_type);
+            tool_call_json_args_add(&args, name, param_name, value, type, schema_type, diag);
             free(param_name);
             free(param_is_string);
             free(raw_value);
@@ -4845,15 +4914,57 @@ static bool parse_generated_message_for_response(const char *text,
                                                  char **content_out,
                                                  char **reasoning_out,
                                                  tool_calls *calls,
-                                                 bool *recovered_out) {
+                                                 bool *recovered_out,
+                                                 char **coerced_summary_out,
+                                                 char **rejected_reason_out) {
     if (recovered_out) *recovered_out = false;
+    if (coerced_summary_out) *coerced_summary_out = NULL;
+    if (rejected_reason_out) *rejected_reason_out = NULL;
 
+    tool_arg_diag diag = {0};
     bool parsed_ok = parse_generated_message_ex(text ? text : "",
                                                 require_thinking_closed,
                                                 orders,
+                                                &diag,
                                                 content_out, reasoning_out,
                                                 calls);
-    if (parsed_ok) return true;
+
+    if (coerced_summary_out && diag.coerced.len) {
+        *coerced_summary_out = xstrdup(diag.coerced.ptr);
+    }
+
+    /* Schema mismatch the parser could not coerce: the structural parse
+     * succeeded but at least one value violates the tool's declared types
+     * (e.g. string="true">hello for a number param).  Refuse the call rather
+     * than shipping a broken one the client will reject without context, and
+     * append the rejection sentence to the assistant content so the model can
+     * read its own mistake on the next turn and correct it. */
+    if (parsed_ok && diag.rejected.len) {
+        if (rejected_reason_out) *rejected_reason_out = xstrdup(diag.rejected.ptr);
+        free(*content_out);
+        free(*reasoning_out);
+        *reasoning_out = NULL;
+        tool_calls_free(calls);
+        buf out = {0};
+        buf_puts(&out, text ? text : "");
+        if (out.len && out.ptr[out.len - 1] != '\n') buf_putc(&out, '\n');
+        buf_putc(&out, '\n');
+        buf_puts(&out, diag.rejected.ptr);
+        *content_out = buf_take(&out);
+        const char *finish = finish_io && *finish_io ? *finish_io : "stop";
+        if (has_tools && strcmp(finish, "error") != 0) {
+            if (finish_io) *finish_io = tool_parse_failure_recovery_finish(finish);
+            if (err && errlen) snprintf(err, errlen, "tool call rejected on type mismatch");
+            if (recovered_out) *recovered_out = true;
+        }
+        tool_arg_diag_free(&diag);
+        return false;
+    }
+
+    if (parsed_ok) {
+        tool_arg_diag_free(&diag);
+        return true;
+    }
 
     free(*content_out);
     free(*reasoning_out);
@@ -4872,6 +4983,7 @@ static bool parse_generated_message_for_response(const char *text,
         if (err && errlen) snprintf(err, errlen, "invalid tool call");
         if (recovered_out) *recovered_out = true;
     }
+    tool_arg_diag_free(&diag);
     return false;
 }
 
@@ -11048,6 +11160,8 @@ decode_again:
     const char *final_finish = finish;
     bool recovered_tool_parse_failure = false;
     if (!client_stream_failed && j->req.kind == REQ_CHAT) {
+        char *coerced_summary = NULL;
+        char *rejected_reason = NULL;
         bool parsed_ok = parse_generated_message_for_response(
             text.ptr ? text.ptr : "",
             j->req.has_tools,
@@ -11060,7 +11174,31 @@ decode_again:
             &parsed_content,
             &parsed_reasoning,
             &parsed_calls,
-            &recovered_tool_parse_failure);
+            &recovered_tool_parse_failure,
+            &coerced_summary,
+            &rejected_reason);
+        if (coerced_summary) {
+            server_log(DS4_LOG_WARNING,
+                       "ds4-server: chat ctx=%s%s%s coerced DSML arg(s) to schema type: %s",
+                       ctx_span,
+                       req_flags[0] ? " " : "",
+                       req_flags,
+                       coerced_summary);
+            trace_event(s, trace_id,
+                        "coerced DSML arg(s) to schema type: %s", coerced_summary);
+            free(coerced_summary);
+        }
+        if (rejected_reason) {
+            server_log(DS4_LOG_WARNING,
+                       "ds4-server: chat ctx=%s%s%s tool call rejected on type mismatch: %s",
+                       ctx_span,
+                       req_flags[0] ? " " : "",
+                       req_flags,
+                       rejected_reason);
+            trace_event(s, trace_id,
+                        "tool call rejected on type mismatch: %s", rejected_reason);
+            free(rejected_reason);
+        }
         if (!parsed_ok && recovered_tool_parse_failure && j->req.has_tools && saw_tool_start) {
             /* parse_generated_message failed even though DSML was present.
              * Semantic repair is intentionally avoided: if the parser cannot
@@ -12719,7 +12857,7 @@ static void test_anthropic_tool_stream_sends_live_tool_use(void) {
     char *parsed_content = NULL;
     char *parsed_reasoning = NULL;
     tool_calls calls = {0};
-    TEST_ASSERT(parse_generated_message_ex(raw_complete, false, NULL, &parsed_content,
+    TEST_ASSERT(parse_generated_message_ex(raw_complete, false, NULL, NULL, &parsed_content,
                                            &parsed_reasoning, &calls));
     TEST_ASSERT(calls.len == 1);
     apply_anthropic_stream_tool_ids(&calls, &st);
@@ -13056,7 +13194,7 @@ static void test_openai_tool_stream_sends_partial_arguments(void) {
     char *parsed_content = NULL;
     char *parsed_reasoning = NULL;
     tool_calls calls = {0};
-    TEST_ASSERT(parse_generated_message_ex(raw_complete, false, NULL, &parsed_content, &parsed_reasoning, &calls));
+    TEST_ASSERT(parse_generated_message_ex(raw_complete, false, NULL, NULL, &parsed_content, &parsed_reasoning, &calls));
     TEST_ASSERT(calls.len == 1);
     apply_openai_stream_tool_ids(&calls, &st);
     TEST_ASSERT(calls.v[0].id != NULL);
@@ -13602,7 +13740,7 @@ static void test_parse_short_dsml_and_canonical_suffix(void) {
     char *content = NULL;
     char *reasoning = NULL;
     tool_calls calls = {0};
-    TEST_ASSERT(parse_generated_message_ex(generated, false, NULL, &content, &reasoning, &calls));
+    TEST_ASSERT(parse_generated_message_ex(generated, false, NULL, NULL, &content, &reasoning, &calls));
     TEST_ASSERT(reasoning && !strcmp(reasoning, "need a tool"));
     TEST_ASSERT(content && content[0] == '\0');
     TEST_ASSERT(calls.len == 1);
@@ -13642,7 +13780,7 @@ static void test_dsml_parser_recovers_loose_nested_parameters(void) {
     char *content = NULL;
     char *reasoning = NULL;
     tool_calls calls = {0};
-    TEST_ASSERT(parse_generated_message_ex(generated, false, NULL, &content, &reasoning, &calls));
+    TEST_ASSERT(parse_generated_message_ex(generated, false, NULL, NULL, &content, &reasoning, &calls));
     TEST_ASSERT(content && !strcmp(content, "review done"));
     TEST_ASSERT(calls.len == 1);
     TEST_ASSERT(calls.v[0].name && !strcmp(calls.v[0].name, "edit"));
@@ -13888,7 +14026,9 @@ static void test_tool_parse_failure_returns_recoverable_finish(void) {
                                                        &content,
                                                        &reasoning,
                                                        &calls,
-                                                       &recovered));
+                                                       &recovered,
+                                                       NULL,
+                                                       NULL));
     TEST_ASSERT(recovered);
     TEST_ASSERT(!strcmp(finish, "stop"));
     TEST_ASSERT(!strcmp(err, "invalid tool call"));
@@ -13936,7 +14076,7 @@ static void test_thinking_dsml_is_not_executable_before_think_close(void) {
     char *content = NULL;
     char *reasoning = NULL;
     tool_calls calls = {0};
-    TEST_ASSERT(parse_generated_message_ex(generated, true, NULL,
+    TEST_ASSERT(parse_generated_message_ex(generated, true, NULL, NULL,
                                            &content, &reasoning, &calls));
     TEST_ASSERT(calls.len == 0);
     TEST_ASSERT(reasoning && strstr(reasoning, DS4_TOOL_CALLS_START) != NULL);
@@ -13959,7 +14099,7 @@ static void test_thinking_dsml_after_think_close_is_executable(void) {
     char *content = NULL;
     char *reasoning = NULL;
     tool_calls calls = {0};
-    TEST_ASSERT(parse_generated_message_ex(generated, true, NULL,
+    TEST_ASSERT(parse_generated_message_ex(generated, true, NULL, NULL,
                                            &content, &reasoning, &calls));
     TEST_ASSERT(calls.len == 1);
     TEST_ASSERT(reasoning && !strcmp(reasoning, "need a shell check"));
@@ -13997,7 +14137,7 @@ static void test_tool_checkpoint_suffix_is_future_prompt_canonical(void) {
     char *content = NULL;
     char *reasoning = NULL;
     tool_calls calls = {0};
-    TEST_ASSERT(parse_generated_message_ex(generated, false, NULL, &content, &reasoning, &calls));
+    TEST_ASSERT(parse_generated_message_ex(generated, false, NULL, NULL, &content, &reasoning, &calls));
     TEST_ASSERT(calls.len == 1);
     TEST_ASSERT(strstr(calls.v[0].arguments, "cd /tmp && git diff 2>/dev/null") != NULL);
     TEST_ASSERT(strstr(calls.v[0].arguments, "&amp;&amp;") == NULL);
@@ -14076,7 +14216,7 @@ static void test_tool_checkpoint_minifies_json_parameters(void) {
     char *content = NULL;
     char *reasoning = NULL;
     tool_calls calls = {0};
-    TEST_ASSERT(parse_generated_message_ex(generated, false, NULL, &content, &reasoning, &calls));
+    TEST_ASSERT(parse_generated_message_ex(generated, false, NULL, NULL, &content, &reasoning, &calls));
     TEST_ASSERT(calls.len == 1);
 
     request r;
@@ -14133,7 +14273,7 @@ static void test_tool_memory_replays_sampled_dsml(void) {
     char *content = NULL;
     char *reasoning = NULL;
     tool_calls sampled = {0};
-    TEST_ASSERT(parse_generated_message_ex(generated, false, NULL, &content, &reasoning, &sampled));
+    TEST_ASSERT(parse_generated_message_ex(generated, false, NULL, NULL, &content, &reasoning, &sampled));
     TEST_ASSERT(sampled.len == 1);
 
     server s;
@@ -14743,7 +14883,7 @@ static void test_tool_separator_whitespace_is_not_content(void) {
     char *content = NULL;
     char *reasoning = NULL;
     tool_calls calls = {0};
-    TEST_ASSERT(parse_generated_message_ex(generated, false, NULL, &content, &reasoning, &calls));
+    TEST_ASSERT(parse_generated_message_ex(generated, false, NULL, NULL, &content, &reasoning, &calls));
     TEST_ASSERT(reasoning && !strcmp(reasoning, "need a tool"));
     TEST_ASSERT(content && !strcmp(content, "I will inspect the files."));
     TEST_ASSERT(calls.len == 1);
