@@ -8904,12 +8904,22 @@ static int kv_cache_try_load(server *s, const request *req,
                              ds4_tokens *effective_prompt,
                              char **loaded_path_out,
                              uint8_t *loaded_ext_flags_out) {
+    /* consume_loaded=false: keep large continued checkpoints on disk after a
+     * hit instead of unlinking them.  The original "consume oversize files"
+     * policy assumed a session-level snapshot is one-shot, but the most common
+     * reuse is the SAME chat continuing after a client abort: the abort
+     * recovery loaded checkpoint X, the next request needs to fall back to
+     * roughly X again, and if X was unlinked we drop all the way to the
+     * system-prompt prefix and reprefill tens of thousands of tokens.  Disk
+     * eviction (pre-store eviction inside ds4_kvstore) already bounds total
+     * usage, so the file will be reclaimed when actually needed instead of
+     * pre-emptively. */
     return kv_cache_try_load_text(s, req ? req->prompt_text : NULL,
                                   effective_prompt,
                                   loaded_path_out,
                                   loaded_ext_flags_out,
                                   req && req->api == API_RESPONSES,
-                                  true);
+                                  false);
 }
 
 static int live_text_prefix_prompt(server *s, const request *req,
