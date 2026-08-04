@@ -10015,8 +10015,37 @@ typedef struct {
     bool enable_cors;
     bool headers_sent;
     bool stream_failed;
+    bool client_disconnected;
     double last_keepalive;
 } server_prefill_progress;
+
+static bool server_prefill_cancelled(void *ud) {
+    server_prefill_progress *p = ud;
+    if (!p || p->fd < 0) return false;
+    if (p->client_disconnected) return true;
+
+    struct pollfd socket = {.fd = p->fd, .events = POLLIN};
+    int rc;
+    do {
+        rc = poll(&socket, 1, 0);
+    } while (rc < 0 && errno == EINTR);
+    if (rc <= 0) return false;
+
+    bool disconnected = (socket.revents & (POLLHUP | POLLERR | POLLNVAL)) != 0;
+    if (!disconnected && (socket.revents & POLLIN)) {
+        char byte;
+        ssize_t n = recv(p->fd, &byte, 1, MSG_PEEK | MSG_DONTWAIT);
+        disconnected = n == 0 ||
+            (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR);
+    }
+    if (!disconnected) return false;
+
+    p->client_disconnected = true;
+    server_log(DS4_LOG_PREFILL,
+               "ds4-server: %s ctx=%s prefill cancelled: client disconnected",
+               p->kind == REQ_CHAT ? "chat" : "completion", p->ctx);
+    return true;
+}
 
 static void request_ctx_span(char *buf, size_t len, int cached, int prompt) {
     int suffix = prompt - cached;
@@ -10378,6 +10407,16 @@ static int server_session_sync(server *s, server_slot *slot,
         }
     }
     return g_stop_requested ? DS4_SESSION_SYNC_INTERRUPTED : 0;
+}
+
+static int server_session_sync_interruptible(server *s, server_slot *slot,
+                                             const ds4_tokens *prompt,
+                                             server_prefill_progress *progress,
+                                             char *err, size_t errlen) {
+    ds4_session_set_cancel(slot->session, server_prefill_cancelled, progress);
+    int rc = server_session_sync(s, slot, prompt, err, errlen);
+    ds4_session_set_cancel(slot->session, NULL, NULL);
+    return rc;
 }
 
 static bool append_rendered_suffix_to_live_session(server *s, server_slot *slot,
@@ -11249,13 +11288,23 @@ static void generate_job(server *s, server_slot *slot, job *j) {
     {
         ds4_tokens prefix = {0};
         tokens_copy_prefix(&prefix, prompt_for_sync, cold_store_len);
-        if (server_session_sync(s, slot, &prefix, err, sizeof(err)) != 0) {
+        int sync_rc = server_session_sync_interruptible(
+            s, slot, &prefix, &progress, err, sizeof(err));
+        if (sync_rc != 0) {
             ds4_tokens_free(&prefix);
             ds4_tokens_free(&effective_prompt);
             ds4_session_set_progress(slot->session, NULL, NULL);
             ds4_session_set_display_progress(slot->session, NULL, NULL);
             kv_cache_slot_restore_suppressed(slot, suppressed_continued_last,
                                              cold_store_len);
+            if (sync_rc == DS4_SESSION_SYNC_INTERRUPTED &&
+                progress.client_disconnected) {
+                free(disk_cache_path);
+                trace_event(s, trace_id,
+                            "prefill cancelled by client disconnect at %d/%d",
+                            ds4_session_pos(slot->session), prompt_tokens);
+                return;
+            }
             kv_cache_discard_failed_disk_entry(s, slot, disk_cache_path);
             free(disk_cache_path);
             trace_event(s, trace_id, "prefill failed: %s", err);
@@ -11274,13 +11323,22 @@ static void generate_job(server *s, server_slot *slot, job *j) {
         ds4_tokens_free(&prefix);
     }
 
-    if (server_session_sync(s, slot, prompt_for_sync,
-                            err, sizeof(err)) != 0) {
+    int sync_rc = server_session_sync_interruptible(
+        s, slot, prompt_for_sync, &progress, err, sizeof(err));
+    if (sync_rc != 0) {
         ds4_tokens_free(&effective_prompt);
         ds4_session_set_progress(slot->session, NULL, NULL);
         ds4_session_set_display_progress(slot->session, NULL, NULL);
         kv_cache_slot_restore_suppressed(slot, suppressed_continued_last,
                                          cold_store_len);
+        if (sync_rc == DS4_SESSION_SYNC_INTERRUPTED &&
+            progress.client_disconnected) {
+            free(disk_cache_path);
+            trace_event(s, trace_id,
+                        "prefill cancelled by client disconnect at %d/%d",
+                        ds4_session_pos(slot->session), prompt_tokens);
+            return;
+        }
         kv_cache_discard_failed_disk_entry(s, slot, disk_cache_path);
         free(disk_cache_path);
         trace_event(s, trace_id, "prefill failed: %s", err);
@@ -17544,6 +17602,24 @@ static void test_thinking_canonical_non_thinking_mode_noop(void) {
     chat_msgs_free(&msgs);
 }
 
+static void test_prefill_cancel_detects_disconnected_client(void) {
+    int fds[2] = {-1, -1};
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
+    if (fds[0] < 0 || fds[1] < 0) return;
+
+    server_prefill_progress progress = {
+        .kind = REQ_CHAT,
+        .fd = fds[0],
+    };
+    snprintf(progress.ctx, sizeof(progress.ctx), "0..8192:8192");
+    TEST_ASSERT(!server_prefill_cancelled(&progress));
+    close(fds[1]);
+    TEST_ASSERT(server_prefill_cancelled(&progress));
+    TEST_ASSERT(progress.client_disconnected);
+    TEST_ASSERT(server_prefill_cancelled(&progress));
+    close(fds[0]);
+}
+
 static void test_admin_stats_reports_each_active_slot(void) {
     server s = {0};
     server_slot slots[2] = {0};
@@ -17566,6 +17642,7 @@ static void test_admin_stats_reports_each_active_slot(void) {
 }
 
 static void ds4_server_unit_tests_run(void) {
+    test_prefill_cancel_detects_disconnected_client();
     test_admin_stats_reports_each_active_slot();
     test_batched_prefill_round_robin();
     test_mixed_prefill_quantum_option();
