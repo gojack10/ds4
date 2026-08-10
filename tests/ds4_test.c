@@ -1,5 +1,66 @@
 #define DS4_SERVER_TEST
 #define DS4_SERVER_TEST_NO_MAIN
+
+#include <stdbool.h>
+#include <stddef.h>
+
+/* Test-only contract seam. Production supplies this under DS4_SERVER_TEST once
+ * abort recovery exists; the missing definition is the intentional RED link. */
+typedef enum {
+    ABORT_TEST_PREFILL_DISCONNECT,
+    ABORT_TEST_FINAL_WRITE_FAILURE,
+} abort_test_scenario;
+
+typedef enum {
+    ABORT_TEST_CANCEL,
+    ABORT_TEST_CLEAR_LIVE_STATE,
+    ABORT_TEST_STORE_DISPLACED,
+    ABORT_TEST_LOAD_CLEAN,
+    ABORT_TEST_REPLAY_PROMPT,
+    ABORT_TEST_INVALIDATE,
+    ABORT_TEST_STORE_CONTINUED,
+    ABORT_TEST_REMEMBER_TOOL,
+    ABORT_TEST_REMEMBER_LIVE,
+    ABORT_TEST_FINAL_WRITE,
+} abort_test_event_kind;
+
+typedef struct {
+    abort_test_event_kind kind;
+    int tokens;
+    bool generated;
+    bool consume;
+    char sha[41];
+    char protected_sha[41];
+} abort_test_event;
+
+typedef struct {
+    abort_test_scenario scenario;
+    int clean_prefix_tokens;
+    int prompt_tokens;
+    int partial_live_tokens;
+    int generated_tokens;
+    bool generated_tool_call;
+    bool checkpoint_oversized;
+    bool eviction_pressure;
+    bool replay_fails;
+    char incoming_sha[41];
+} abort_test_input;
+
+typedef struct {
+    abort_test_event events[24];
+    size_t events_len;
+    int live_tokens;
+    int recovery_loads;
+    int protocol_live_entries;
+    int tool_memory_entries;
+    bool live_invalidated;
+    bool clean_checkpoint_exists;
+    char loaded_sha[41];
+} abort_test_result;
+
+extern int ds4_server_test_abort_recovery_trace(const abort_test_input *input,
+                                                 abort_test_result *result);
+
 #include "../ds4_server.c"
 #ifndef DS4_NO_GPU
 #include "../ds4_gpu.h"
@@ -6780,6 +6841,113 @@ static void test_dspark_verify_depth(void) {
 }
 #endif
 
+static int abort_test_event_index(const abort_test_result *r,
+                                  abort_test_event_kind kind) {
+    for (size_t i = 0; i < r->events_len; i++) {
+        if (r->events[i].kind == kind) return (int)i;
+    }
+    return -1;
+}
+
+static const abort_test_event *abort_test_event_find(
+        const abort_test_result *r, abort_test_event_kind kind) {
+    int i = abort_test_event_index(r, kind);
+    return i >= 0 ? &r->events[i] : NULL;
+}
+
+static bool abort_test_has_generated_continued_store(
+        const abort_test_result *r) {
+    for (size_t i = 0; i < r->events_len; i++) {
+        if (r->events[i].kind == ABORT_TEST_STORE_CONTINUED &&
+            r->events[i].generated) return true;
+    }
+    return false;
+}
+
+static bool abort_test_run(const abort_test_input *in, abort_test_result *out) {
+    memset(out, 0, sizeof(*out));
+    int rc = ds4_server_test_abort_recovery_trace(in, out);
+    TEST_ASSERT(rc == 0);
+    return rc == 0;
+}
+
+static void test_abort_kv_recovery_contract(void) {
+    const char *sha = "0123456789abcdef0123456789abcdef01234567";
+    abort_test_input prefill = {
+        .scenario = ABORT_TEST_PREFILL_DISCONNECT,
+        .clean_prefix_tokens = 49152,
+        .prompt_tokens = 50096,
+        .partial_live_tokens = 49700,
+        .checkpoint_oversized = true,
+    };
+    snprintf(prefill.incoming_sha, sizeof(prefill.incoming_sha), "%s", sha);
+
+    /* A: cancellation restores the exact prompt and keeps clean disk/live state. */
+    abort_test_result a;
+    if (!abort_test_run(&prefill, &a)) return;
+    int cancel = abort_test_event_index(&a, ABORT_TEST_CANCEL);
+    int clear = abort_test_event_index(&a, ABORT_TEST_CLEAR_LIVE_STATE);
+    int load = abort_test_event_index(&a, ABORT_TEST_LOAD_CLEAN);
+    int replay = abort_test_event_index(&a, ABORT_TEST_REPLAY_PROMPT);
+    const abort_test_event *load_event = abort_test_event_find(&a, ABORT_TEST_LOAD_CLEAN);
+    TEST_ASSERT(cancel >= 0 && clear > cancel && load > clear && replay > load);
+    TEST_ASSERT(load_event && !load_event->consume);
+    TEST_ASSERT(a.recovery_loads == 1);
+    TEST_ASSERT(a.clean_checkpoint_exists);
+    TEST_ASSERT(!a.live_invalidated);
+    TEST_ASSERT(a.protocol_live_entries == 0);
+    TEST_ASSERT(a.tool_memory_entries == 0);
+    TEST_ASSERT(a.live_tokens == prefill.prompt_tokens);
+    TEST_ASSERT(!strcmp(a.loaded_sha, sha));
+
+    abort_test_input replay_failure = prefill;
+    replay_failure.replay_fails = true;
+    abort_test_result failed;
+    TEST_ASSERT(abort_test_run(&replay_failure, &failed));
+    TEST_ASSERT(failed.live_invalidated);
+
+    /* B: generated streamed state is uncommitted when the final write fails. */
+    abort_test_input final = prefill;
+    final.scenario = ABORT_TEST_FINAL_WRITE_FAILURE;
+    final.partial_live_tokens = final.prompt_tokens + 32;
+    final.generated_tokens = 32;
+    final.generated_tool_call = true;
+    abort_test_result b;
+    if (!abort_test_run(&final, &b)) return;
+    int final_write = abort_test_event_index(&b, ABORT_TEST_FINAL_WRITE);
+    cancel = abort_test_event_index(&b, ABORT_TEST_CANCEL);
+    clear = abort_test_event_index(&b, ABORT_TEST_CLEAR_LIVE_STATE);
+    load = abort_test_event_index(&b, ABORT_TEST_LOAD_CLEAN);
+    replay = abort_test_event_index(&b, ABORT_TEST_REPLAY_PROMPT);
+    TEST_ASSERT(final_write >= 0 && cancel > final_write && clear > cancel &&
+                load > clear && replay > load);
+    TEST_ASSERT(!abort_test_has_generated_continued_store(&b));
+    TEST_ASSERT(abort_test_event_index(&b, ABORT_TEST_REMEMBER_TOOL) < 0);
+    TEST_ASSERT(abort_test_event_index(&b, ABORT_TEST_REMEMBER_LIVE) < 0);
+    TEST_ASSERT(b.tool_memory_entries == 0 && b.protocol_live_entries == 0);
+    TEST_ASSERT(b.live_tokens == final.prompt_tokens);
+    TEST_ASSERT(b.clean_checkpoint_exists && !b.live_invalidated);
+
+    /* C: the same oversized checkpoint survives two independent aborts. */
+    abort_test_result c1, c2;
+    TEST_ASSERT(abort_test_run(&final, &c1));
+    TEST_ASSERT(c1.clean_checkpoint_exists && c1.recovery_loads == 1);
+    TEST_ASSERT(abort_test_run(&final, &c2));
+    TEST_ASSERT(c2.clean_checkpoint_exists && c2.recovery_loads == 1);
+    TEST_ASSERT(!strcmp(c1.loaded_sha, sha) && !strcmp(c2.loaded_sha, sha));
+
+    /* D: displaced-live storage carries the incoming SHA through eviction. */
+    abort_test_input pressure = prefill;
+    pressure.eviction_pressure = true;
+    abort_test_result d;
+    if (!abort_test_run(&pressure, &d)) return;
+    const abort_test_event *store =
+        abort_test_event_find(&d, ABORT_TEST_STORE_DISPLACED);
+    TEST_ASSERT(store != NULL);
+    TEST_ASSERT(store && !strcmp(store->protected_sha, sha));
+    TEST_ASSERT(d.clean_checkpoint_exists);
+}
+
 static void test_server_unit_group(void) {
     ds4_server_unit_tests_run();
 }
@@ -6810,6 +6978,7 @@ static const ds4_test_entry test_entries[] = {
     {"--mtp-verify-depth", "mtp-verify-depth", "MTP speculative verify commits autoregressive-identical tokens at draft depth > 2", test_mtp_verify_depth},
     {"--dspark-verify-depth", "dspark-verify-depth", "DSpark speculative verify commits autoregressive-identical tokens at draft depth > 2", test_dspark_verify_depth},
 #endif
+    {"--abort-kv-contract", "abort-kv-contract", "abort recovery and repeated disk-KV reuse contract", test_abort_kv_recovery_contract},
     {"--server", "server", "server parser/rendering/cache unit tests", test_server_unit_group},
 };
 
