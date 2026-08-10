@@ -4807,6 +4807,19 @@ static char *dsml_value_trimmed_copy(const char *s) {
     return xstrndup(s, n);
 }
 
+static bool dsml_value_is_json_integer(const char *s) {
+    if (!dsml_value_is_json_number(s)) return false;
+    char *trimmed = dsml_value_trimmed_copy(s);
+    char *end = NULL;
+    errno = 0;
+    double value = strtod(trimmed, &end);
+    double integer_part = 0.0;
+    bool valid = errno != ERANGE && end != trimmed && *end == '\0' &&
+                 isfinite(value) && modf(value, &integer_part) == 0.0;
+    free(trimmed);
+    return valid;
+}
+
 /* Per-call diagnostics from DSML argument emission.  All fields are optional
  * on the parser path: callers that pass NULL get the current silent-coerce
  * behavior.  When non-NULL:
@@ -4886,26 +4899,28 @@ static void tool_call_json_args_add(buf *args, const char *tool_name, const char
     json_escape(args, name ? name : "");
     buf_puts(args, ": ");
     bool model_says_string = is_string && !strcmp(is_string, "true");
-    if (model_says_string && schema_type && value) {
-        if (!strcmp(schema_type, "number") || !strcmp(schema_type, "integer")) {
-            if (dsml_value_is_json_number(value)) {
-                char *trimmed = dsml_value_trimmed_copy(value);
-                buf_puts(args, trimmed);
-                free(trimmed);
-                tool_arg_diag_note_coerced(diag, tool_name, name, schema_type);
-                return;
-            }
-            tool_arg_diag_note_rejected(diag, tool_name, name, schema_type, value);
+    if (schema_type && value) {
+        bool valid = true;
+        if (!strcmp(schema_type, "number")) {
+            valid = dsml_value_is_json_number(value);
+        } else if (!strcmp(schema_type, "integer")) {
+            valid = dsml_value_is_json_integer(value);
         } else if (!strcmp(schema_type, "boolean")) {
             char *trimmed = dsml_value_trimmed_copy(value);
-            if (!strcmp(trimmed, "true") || !strcmp(trimmed, "false")) {
-                buf_puts(args, trimmed);
-                free(trimmed);
-                tool_arg_diag_note_coerced(diag, tool_name, name, schema_type);
-                return;
-            }
+            valid = !strcmp(trimmed, "true") || !strcmp(trimmed, "false");
             free(trimmed);
+        }
+        if (!valid) {
             tool_arg_diag_note_rejected(diag, tool_name, name, schema_type, value);
+        } else if (model_says_string &&
+                   (!strcmp(schema_type, "number") ||
+                    !strcmp(schema_type, "integer") ||
+                    !strcmp(schema_type, "boolean"))) {
+            char *trimmed = dsml_value_trimmed_copy(value);
+            buf_puts(args, trimmed);
+            free(trimmed);
+            tool_arg_diag_note_coerced(diag, tool_name, name, schema_type);
+            return;
         }
     }
     if (model_says_string) {
