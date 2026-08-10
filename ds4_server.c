@@ -4809,15 +4809,61 @@ static char *dsml_value_trimmed_copy(const char *s) {
 
 static bool dsml_value_is_json_integer(const char *s) {
     if (!dsml_value_is_json_number(s)) return false;
-    char *trimmed = dsml_value_trimmed_copy(s);
-    char *end = NULL;
-    errno = 0;
-    double value = strtod(trimmed, &end);
-    double integer_part = 0.0;
-    bool valid = errno != ERANGE && end != trimmed && *end == '\0' &&
-                 isfinite(value) && modf(value, &integer_part) == 0.0;
-    free(trimmed);
-    return valid;
+    while (*s == ' ' || *s == '\t' || *s == '\r' || *s == '\n') s++;
+    if (*s == '-') s++;
+
+    size_t coefficient_digits = 0;
+    size_t fraction_digits = 0;
+    bool coefficient_is_zero = true;
+    while (*s >= '0' && *s <= '9') {
+        coefficient_is_zero &= *s == '0';
+        coefficient_digits++;
+        s++;
+    }
+    if (*s == '.') {
+        s++;
+        while (*s >= '0' && *s <= '9') {
+            coefficient_is_zero &= *s == '0';
+            coefficient_digits++;
+            fraction_digits++;
+            s++;
+        }
+    }
+    const char *coefficient_end = s;
+
+    bool exponent_negative = false;
+    size_t exponent = 0;
+    if (*s == 'e' || *s == 'E') {
+        s++;
+        if (*s == '+' || *s == '-') {
+            exponent_negative = *s == '-';
+            s++;
+        }
+        while (*s >= '0' && *s <= '9') {
+            size_t digit = (size_t)(*s++ - '0');
+            exponent = exponent <= (SIZE_MAX - digit) / 10
+                           ? exponent * 10 + digit
+                           : SIZE_MAX;
+        }
+    }
+
+    if (coefficient_is_zero) return true;
+    size_t required_zeros;
+    if (!exponent_negative) {
+        if (exponent >= fraction_digits) return true;
+        required_zeros = fraction_digits - exponent;
+    } else {
+        if (exponent > coefficient_digits - fraction_digits) return false;
+        required_zeros = fraction_digits + exponent;
+    }
+
+    while (required_zeros) {
+        coefficient_end--;
+        if (*coefficient_end == '.') continue;
+        if (*coefficient_end != '0') return false;
+        required_zeros--;
+    }
+    return true;
 }
 
 /* Per-call diagnostics from DSML argument emission.  All fields are optional
