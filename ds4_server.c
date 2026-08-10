@@ -594,6 +594,9 @@ typedef struct {
      * happens to be named "tool_search". */
     bool responses_tool_search;
     char **prop;
+    /* JSON Schema "type" for each prop ("string","number","integer","boolean",
+     * "array","object","null"), or NULL when unknown.  Parallel to prop[]. */
+    char **prop_type;
     int len;
     int cap;
 } tool_schema_order;
@@ -764,8 +767,12 @@ static void tool_schema_order_free(tool_schema_order *o) {
     free(o->name);
     free(o->wire_name);
     free(o->namespace);
-    for (int i = 0; i < o->len; i++) free(o->prop[i]);
+    for (int i = 0; i < o->len; i++) {
+        free(o->prop[i]);
+        if (o->prop_type) free(o->prop_type[i]);
+    }
     free(o->prop);
+    free(o->prop_type);
     memset(o, 0, sizeof(*o));
 }
 
@@ -775,12 +782,15 @@ static void tool_schema_orders_free(tool_schema_orders *orders) {
     memset(orders, 0, sizeof(*orders));
 }
 
-static void tool_schema_order_prop_push(tool_schema_order *o, char *prop) {
+static void tool_schema_order_prop_push(tool_schema_order *o, char *prop, char *type) {
     if (o->len == o->cap) {
         o->cap = o->cap ? o->cap * 2 : 8;
         o->prop = xrealloc(o->prop, (size_t)o->cap * sizeof(o->prop[0]));
+        o->prop_type = xrealloc(o->prop_type, (size_t)o->cap * sizeof(o->prop_type[0]));
     }
-    o->prop[o->len++] = prop;
+    o->prop[o->len] = prop;
+    o->prop_type[o->len] = type;
+    o->len++;
 }
 
 static int tool_schema_orders_find_index(const tool_schema_orders *orders, const char *name) {
@@ -808,6 +818,24 @@ static void tool_schema_orders_push(tool_schema_orders *orders, tool_schema_orde
 static const tool_schema_order *tool_schema_orders_find(const tool_schema_orders *orders, const char *name) {
     int idx = tool_schema_orders_find_index(orders, name);
     return idx >= 0 ? &orders->v[idx] : NULL;
+}
+
+/* Look up the JSON Schema "type" string for a single tool parameter.
+ * Returns NULL if the schema is missing the tool, the param, or the type field
+ * (e.g. a union-typed param via "anyOf").  Callers must treat NULL as "no
+ * coercion hint available" rather than as "string". */
+static const char *tool_schema_orders_find_prop_type(const tool_schema_orders *orders,
+                                                     const char *tool_name,
+                                                     const char *param_name) {
+    if (!orders || !tool_name || !param_name) return NULL;
+    int idx = tool_schema_orders_find_index(orders, tool_name);
+    if (idx < 0) return NULL;
+    const tool_schema_order *o = &orders->v[idx];
+    if (!o->prop_type) return NULL;
+    for (int i = 0; i < o->len; i++) {
+        if (o->prop[i] && !strcmp(o->prop[i], param_name)) return o->prop_type[i];
+    }
+    return NULL;
 }
 
 static void request_init(request *r, req_kind kind, int max_tokens) {
@@ -1431,6 +1459,44 @@ done:
     return out;
 }
 
+/* Pull the JSON Schema "type" field out of a property definition body like
+ * {"type":"number","description":"..."}.  Returns a freshly-allocated string or
+ * NULL when the body is not an object, has no "type", or "type" is non-string
+ * (e.g. an array for unions).  We do not normalize: callers compare against the
+ * canonical lowercase JSON Schema keywords. */
+static char *parse_schema_property_type(const char *json) {
+    if (!json) return NULL;
+    const char *p = json;
+    json_ws(&p);
+    if (*p != '{') return NULL;
+    p++;
+    json_ws(&p);
+    while (*p && *p != '}') {
+        char *key = NULL;
+        if (!json_string(&p, &key)) return NULL;
+        json_ws(&p);
+        if (*p != ':') {
+            free(key);
+            return NULL;
+        }
+        p++;
+        if (!strcmp(key, "type")) {
+            free(key);
+            json_ws(&p);
+            if (*p != '"') return NULL;
+            char *type = NULL;
+            if (!json_string(&p, &type)) return NULL;
+            return type;
+        }
+        free(key);
+        if (!json_skip_value(&p)) return NULL;
+        json_ws(&p);
+        if (*p == ',') p++;
+        json_ws(&p);
+    }
+    return NULL;
+}
+
 static bool parse_schema_properties(const char *json, tool_schema_order *order) {
     const char *p = json;
     json_ws(&p);
@@ -1461,8 +1527,14 @@ static bool parse_schema_properties(const char *json, tool_schema_order *order) 
                     return false;
                 }
                 p++;
-                tool_schema_order_prop_push(order, prop);
-                if (!json_skip_value(&p)) return false;
+                char *body = NULL;
+                if (!json_raw_value(&p, &body)) {
+                    free(prop);
+                    return false;
+                }
+                char *type = parse_schema_property_type(body);
+                free(body);
+                tool_schema_order_prop_push(order, prop, type);
                 json_ws(&p);
                 if (*p == ',') p++;
                 json_ws(&p);
@@ -4692,11 +4764,151 @@ static char *dsml_attr(const char *tag, const char *name) {
     return decoded;
 }
 
-static void tool_call_json_args_add(buf *args, const char *name, const char *value, const char *is_string) {
+/* Is the value (trimmed of surrounding ASCII whitespace) a syntactically valid
+ * JSON number and nothing else?  Strict by design: must consume the whole
+ * value, no trailing characters, no NaN/Infinity, no leading "+".  This lets
+ * the caller safely splice the original bytes into the emitted JSON. */
+static bool dsml_value_is_json_number(const char *s) {
+    if (!s) return false;
+    while (*s == ' ' || *s == '\t' || *s == '\r' || *s == '\n') s++;
+    const char *start = s;
+    if (*s == '-') s++;
+    if (*s == '0') {
+        s++;
+    } else if (*s >= '1' && *s <= '9') {
+        while (*s >= '0' && *s <= '9') s++;
+    } else {
+        return false;
+    }
+    if (*s == '.') {
+        s++;
+        if (!(*s >= '0' && *s <= '9')) return false;
+        while (*s >= '0' && *s <= '9') s++;
+    }
+    if (*s == 'e' || *s == 'E') {
+        s++;
+        if (*s == '+' || *s == '-') s++;
+        if (!(*s >= '0' && *s <= '9')) return false;
+        while (*s >= '0' && *s <= '9') s++;
+    }
+    if (s == start) return false;
+    while (*s == ' ' || *s == '\t' || *s == '\r' || *s == '\n') s++;
+    return *s == '\0';
+}
+
+/* Trim surrounding ASCII whitespace and copy.  Returned pointer must be freed. */
+static char *dsml_value_trimmed_copy(const char *s) {
+    if (!s) return xstrdup("");
+    while (*s == ' ' || *s == '\t' || *s == '\r' || *s == '\n') s++;
+    size_t n = strlen(s);
+    while (n > 0 && (s[n - 1] == ' ' || s[n - 1] == '\t' ||
+                     s[n - 1] == '\r' || s[n - 1] == '\n'))
+        n--;
+    return xstrndup(s, n);
+}
+
+/* Per-call diagnostics from DSML argument emission.  All fields are optional
+ * on the parser path: callers that pass NULL get the current silent-coerce
+ * behavior.  When non-NULL:
+ *   coerced - comma-separated "tool.param=>type" of each coerced arg (logged)
+ *   rejected - first uncoercible argument as a model-readable sentence
+ *              (e.g. "parameter 'limit' on tool 'read' must be a number, got
+ *              \"hello\""), used to refuse the call and tell the model why. */
+typedef struct {
+    buf coerced;
+    buf rejected;
+} tool_arg_diag;
+
+static void tool_arg_diag_free(tool_arg_diag *d) {
+    if (!d) return;
+    buf_free(&d->coerced);
+    buf_free(&d->rejected);
+}
+
+static void tool_arg_diag_note_coerced(tool_arg_diag *d, const char *tool,
+                                       const char *param, const char *type) {
+    if (!d) return;
+    if (d->coerced.len) buf_puts(&d->coerced, ", ");
+    buf_puts(&d->coerced, tool ? tool : "?");
+    buf_putc(&d->coerced, '.');
+    buf_puts(&d->coerced, param ? param : "?");
+    buf_puts(&d->coerced, "=>");
+    buf_puts(&d->coerced, type ? type : "?");
+}
+
+static void tool_arg_diag_note_rejected(tool_arg_diag *d, const char *tool,
+                                        const char *param, const char *type,
+                                        const char *value) {
+    /* Keep only the first rejection: one clear message is more useful to the
+     * model than a wall of conflicting complaints, and the model has to fix
+     * the call wholesale before any later issue matters. */
+    if (!d || d->rejected.len) return;
+    buf_puts(&d->rejected, "Tool call rejected: parameter '");
+    buf_puts(&d->rejected, param ? param : "?");
+    buf_puts(&d->rejected, "' on tool '");
+    buf_puts(&d->rejected, tool ? tool : "?");
+    buf_puts(&d->rejected, "' must be a ");
+    buf_puts(&d->rejected, type ? type : "?");
+    buf_puts(&d->rejected, ", but the value ");
+    buf_putc(&d->rejected, '"');
+    /* Truncate long values to keep the synthetic note compact.  120 chars is
+     * long enough to spot the offender, short enough not to balloon prompts. */
+    const char *v = value ? value : "";
+    size_t vn = strlen(v);
+    if (vn > 120) {
+        buf_append(&d->rejected, v, 120);
+        buf_puts(&d->rejected, "...");
+    } else {
+        buf_puts(&d->rejected, v);
+    }
+    buf_putc(&d->rejected, '"');
+    buf_puts(&d->rejected, " is not a valid ");
+    buf_puts(&d->rejected, type ? type : "?");
+    buf_puts(&d->rejected, ". Re-emit the tool call with the correct type.");
+}
+
+/* Emit one DSML-derived argument as JSON.
+ *
+ * Coercion: the model is supposed to set string="true|false" to indicate JSON
+ * type, but in practice it frequently emits string="true" for numeric values
+ * (e.g. `name="limit" string="true">15`).  When the caller has the tool's JSON
+ * Schema for this param and the schema declares number/integer/boolean, we
+ * coerce the value to that JSON type as long as the literal still parses.
+ * Without a schema we fall back to the model's stated type so we never break
+ * legitimately-string params that happen to look like numbers.
+ *
+ * tool_name is used only to populate diag messages so the caller can log or
+ * tell the model exactly which call was wrong.  diag may be NULL. */
+static void tool_call_json_args_add(buf *args, const char *tool_name, const char *name,
+                                    const char *value, const char *is_string,
+                                    const char *schema_type, tool_arg_diag *diag) {
     if (args->len) buf_puts(args, ", ");
     json_escape(args, name ? name : "");
     buf_puts(args, ": ");
-    if (is_string && !strcmp(is_string, "true")) {
+    bool model_says_string = is_string && !strcmp(is_string, "true");
+    if (model_says_string && schema_type && value) {
+        if (!strcmp(schema_type, "number") || !strcmp(schema_type, "integer")) {
+            if (dsml_value_is_json_number(value)) {
+                char *trimmed = dsml_value_trimmed_copy(value);
+                buf_puts(args, trimmed);
+                free(trimmed);
+                tool_arg_diag_note_coerced(diag, tool_name, name, schema_type);
+                return;
+            }
+            tool_arg_diag_note_rejected(diag, tool_name, name, schema_type, value);
+        } else if (!strcmp(schema_type, "boolean")) {
+            char *trimmed = dsml_value_trimmed_copy(value);
+            if (!strcmp(trimmed, "true") || !strcmp(trimmed, "false")) {
+                buf_puts(args, trimmed);
+                free(trimmed);
+                tool_arg_diag_note_coerced(diag, tool_name, name, schema_type);
+                return;
+            }
+            free(trimmed);
+            tool_arg_diag_note_rejected(diag, tool_name, name, schema_type, value);
+        }
+    }
+    if (model_says_string) {
         json_escape(args, value ? value : "");
     } else {
         char *min = json_minify_raw_value(value ? value : "null");
@@ -4745,7 +4957,10 @@ static bool dsml_parse_leaf_param_json(const char **p_in, const char *param_star
     const char *type = is_string ? is_string : "true";
     char *value = !strcmp(type, "true") ?
         dsml_unescape_text(raw_value) : xstrdup(raw_value);
-    tool_call_json_args_add(out, name, value, type);
+    /* Nested params live one level below the schema's object/array type, so a
+     * direct prop-name lookup against the top-level schema does not apply.
+     * Coercion is skipped here; the outer leaf path handles the common case. */
+    tool_call_json_args_add(out, NULL, name, value, type, NULL, NULL);
 
     free(name);
     free(is_string);
@@ -4842,6 +5057,8 @@ static void ds4_unterminated_reasoning_before_tool(const char *text,
 
 static bool parse_deepseek_generated_message_ex(const char *text,
                                                 bool require_thinking_closed,
+                                                const tool_schema_orders *orders,
+                                                tool_arg_diag *diag,
                                                 char **content_out,
                                                 char **reasoning_out,
                                                 tool_calls *calls) {
@@ -4990,9 +5207,9 @@ static bool parse_deepseek_generated_message_ex(const char *text,
                     buf_free(&args);
                     return false;
                 }
-                tool_call_json_args_add(&args, param_name,
+                tool_call_json_args_add(&args, name, param_name,
                                         nested.ptr ? nested.ptr : "{}",
-                                        "false");
+                                        "false", NULL, NULL);
                 buf_free(&nested);
                 p = skip_ascii_ws(nested_p);
                 if (!strncmp(p, param_end, strlen(param_end))) {
@@ -5013,7 +5230,9 @@ static bool parse_deepseek_generated_message_ex(const char *text,
             const char *type = param_is_string ? param_is_string : "true";
             char *value = !strcmp(type, "true") ?
                 dsml_unescape_text(raw_value) : xstrdup(raw_value);
-            tool_call_json_args_add(&args, param_name, value, type);
+            const char *schema_type =
+                tool_schema_orders_find_prop_type(orders, name, param_name);
+            tool_call_json_args_add(&args, name, param_name, value, type, schema_type, diag);
             free(param_name);
             free(param_is_string);
             free(raw_value);
@@ -5040,6 +5259,8 @@ static void trim_const_span(const char **start, const char **end) {
 
 static bool parse_glm_generated_message_ex(const char *text,
                                            bool require_thinking_closed,
+                                           const tool_schema_orders *orders,
+                                           tool_arg_diag *diag,
                                            char **content_out,
                                            char **reasoning_out,
                                            tool_calls *calls) {
@@ -5143,7 +5364,10 @@ static bool parse_glm_generated_message_ex(const char *text,
             }
             char *raw_value = xstrndup(p, (size_t)(value_end - p));
             char *value = dsml_unescape_text(raw_value);
-            tool_call_json_args_add(&args, key, value, "true");
+            const char *schema_type =
+                tool_schema_orders_find_prop_type(orders, name, key);
+            tool_call_json_args_add(&args, name, key, value, "true",
+                                    schema_type, diag);
             free(key);
             free(raw_value);
             free(value);
@@ -5180,20 +5404,35 @@ static bool parse_glm_generated_message_ex(const char *text,
     return true;
 }
 
-static bool parse_generated_message_ex_for_syntax(server_model_syntax syntax,
-                                                  const char *text,
-                                                  bool require_thinking_closed,
-                                                  char **content_out,
-                                                  char **reasoning_out,
-                                                  tool_calls *calls) {
+static bool parse_generated_message_ex_for_syntax_with_schema(
+        server_model_syntax syntax,
+        const char *text,
+        bool require_thinking_closed,
+        const tool_schema_orders *orders,
+        tool_arg_diag *diag,
+        char **content_out,
+        char **reasoning_out,
+        tool_calls *calls) {
     if (syntax == SERVER_MODEL_SYNTAX_GLM) {
         return parse_glm_generated_message_ex(text, require_thinking_closed,
-                                              content_out, reasoning_out,
-                                              calls);
+                                              orders, diag, content_out,
+                                              reasoning_out, calls);
     }
     return parse_deepseek_generated_message_ex(text, require_thinking_closed,
-                                               content_out, reasoning_out,
-                                               calls);
+                                               orders, diag, content_out,
+                                               reasoning_out, calls);
+}
+
+static bool parse_generated_message_ex_for_syntax(
+        server_model_syntax syntax,
+        const char *text,
+        bool require_thinking_closed,
+        char **content_out,
+        char **reasoning_out,
+        tool_calls *calls) {
+    return parse_generated_message_ex_for_syntax_with_schema(
+        syntax, text, require_thinking_closed, NULL, NULL,
+        content_out, reasoning_out, calls);
 }
 
 static DS4_SERVER_MAYBE_UNUSED bool parse_generated_message_ex(
@@ -5202,12 +5441,9 @@ static DS4_SERVER_MAYBE_UNUSED bool parse_generated_message_ex(
         char **content_out,
         char **reasoning_out,
         tool_calls *calls) {
-    return parse_generated_message_ex_for_syntax(SERVER_MODEL_SYNTAX_DEEPSEEK,
-                                                 text,
-                                                 require_thinking_closed,
-                                                 content_out,
-                                                 reasoning_out,
-                                                 calls);
+    return parse_generated_message_ex_for_syntax(
+        SERVER_MODEL_SYNTAX_DEEPSEEK, text, require_thinking_closed,
+        content_out, reasoning_out, calls);
 }
 
 /* Try to repair a truncated DSML block.
@@ -5283,27 +5519,63 @@ static const char *tool_parse_failure_recovery_finish(const char *finish) {
     return "stop";
 }
 
-static bool parse_generated_message_for_response_for_syntax(server_model_syntax syntax,
-                                                            const char *text,
-                                                            bool has_tools,
-                                                            bool saw_tool_start,
-                                                            bool require_thinking_closed,
-                                                            const char **finish_io,
-                                                            char *err,
-                                                            size_t errlen,
-                                                            char **content_out,
-                                                            char **reasoning_out,
-                                                            tool_calls *calls,
-                                                            bool *recovered_out) {
+static bool parse_generated_message_for_response_for_syntax_with_schema(
+        server_model_syntax syntax,
+        const char *text,
+        bool has_tools,
+        bool saw_tool_start,
+        bool require_thinking_closed,
+        const tool_schema_orders *orders,
+        const char **finish_io,
+        char *err,
+        size_t errlen,
+        char **content_out,
+        char **reasoning_out,
+        tool_calls *calls,
+        bool *recovered_out,
+        char **coerced_summary_out,
+        char **rejected_reason_out) {
     if (recovered_out) *recovered_out = false;
+    if (coerced_summary_out) *coerced_summary_out = NULL;
+    if (rejected_reason_out) *rejected_reason_out = NULL;
 
-    bool parsed_ok = parse_generated_message_ex_for_syntax(syntax,
-                                                           text ? text : "",
-                                                           require_thinking_closed,
-                                                           content_out,
-                                                           reasoning_out,
-                                                           calls);
-    if (parsed_ok) return true;
+    tool_arg_diag diag = {0};
+    bool parsed_ok = parse_generated_message_ex_for_syntax_with_schema(
+        syntax, text ? text : "", require_thinking_closed, orders, &diag,
+        content_out, reasoning_out, calls);
+
+    if (coerced_summary_out && diag.coerced.len) {
+        *coerced_summary_out = xstrdup(diag.coerced.ptr);
+    }
+
+    /* Schema mismatch the parser could not coerce: refuse the call instead of
+     * forwarding invalid arguments, and give the model a correction message. */
+    if (parsed_ok && diag.rejected.len) {
+        if (rejected_reason_out) *rejected_reason_out = xstrdup(diag.rejected.ptr);
+        free(*content_out);
+        free(*reasoning_out);
+        *reasoning_out = NULL;
+        tool_calls_free(calls);
+        buf out = {0};
+        buf_puts(&out, text ? text : "");
+        if (out.len && out.ptr[out.len - 1] != '\n') buf_putc(&out, '\n');
+        buf_putc(&out, '\n');
+        buf_puts(&out, diag.rejected.ptr);
+        *content_out = buf_take(&out);
+        const char *finish = finish_io && *finish_io ? *finish_io : "stop";
+        if (has_tools && strcmp(finish, "error") != 0) {
+            if (finish_io) *finish_io = tool_parse_failure_recovery_finish(finish);
+            if (err && errlen) snprintf(err, errlen, "tool call rejected on type mismatch");
+            if (recovered_out) *recovered_out = true;
+        }
+        tool_arg_diag_free(&diag);
+        return false;
+    }
+
+    if (parsed_ok) {
+        tool_arg_diag_free(&diag);
+        return true;
+    }
 
     free(*content_out);
     free(*reasoning_out);
@@ -5322,7 +5594,27 @@ static bool parse_generated_message_for_response_for_syntax(server_model_syntax 
         if (err && errlen) snprintf(err, errlen, "invalid tool call");
         if (recovered_out) *recovered_out = true;
     }
+    tool_arg_diag_free(&diag);
     return false;
+}
+
+static bool parse_generated_message_for_response_for_syntax(
+        server_model_syntax syntax,
+        const char *text,
+        bool has_tools,
+        bool saw_tool_start,
+        bool require_thinking_closed,
+        const char **finish_io,
+        char *err,
+        size_t errlen,
+        char **content_out,
+        char **reasoning_out,
+        tool_calls *calls,
+        bool *recovered_out) {
+    return parse_generated_message_for_response_for_syntax_with_schema(
+        syntax, text, has_tools, saw_tool_start, require_thinking_closed, NULL,
+        finish_io, err, errlen, content_out, reasoning_out, calls, recovered_out,
+        NULL, NULL);
 }
 
 static DS4_SERVER_MAYBE_UNUSED bool parse_generated_message_for_response(
@@ -12307,8 +12599,9 @@ decode_again:
             tool_calls test_calls = {0};
             char *test_content = NULL;
             char *test_reasoning = NULL;
-            bool repair_ok = parse_generated_message_ex_for_syntax(
+            bool repair_ok = parse_generated_message_ex_for_syntax_with_schema(
                 j->req.model_syntax, repaired.ptr, false,
+                &j->req.tool_orders, NULL,
                 &test_content, &test_reasoning, &test_calls);
             free(test_content);
             free(test_reasoning);
@@ -12410,19 +12703,46 @@ decode_again:
     const char *final_finish = finish;
     bool recovered_tool_parse_failure = false;
     if (j->req.kind == REQ_CHAT) {
-        bool parsed_ok = parse_generated_message_for_response_for_syntax(
+        char *coerced_summary = NULL;
+        char *rejected_reason = NULL;
+        bool parsed_ok = parse_generated_message_for_response_for_syntax_with_schema(
             j->req.model_syntax,
             text.ptr ? text.ptr : "",
             j->req.has_tools,
             saw_tool_start,
             ds4_think_mode_enabled(j->req.think_mode),
+            &j->req.tool_orders,
             &final_finish,
             err,
             sizeof(err),
             &parsed_content,
             &parsed_reasoning,
             &parsed_calls,
-            &recovered_tool_parse_failure);
+            &recovered_tool_parse_failure,
+            &coerced_summary,
+            &rejected_reason);
+        if (coerced_summary) {
+            server_log(DS4_LOG_WARNING,
+                       "ds4-server: chat ctx=%s%s%s coerced DSML arg(s) to schema type: %s",
+                       ctx_span,
+                       req_flags[0] ? " " : "",
+                       req_flags,
+                       coerced_summary);
+            trace_event(s, trace_id,
+                        "coerced DSML arg(s) to schema type: %s", coerced_summary);
+            free(coerced_summary);
+        }
+        if (rejected_reason) {
+            server_log(DS4_LOG_WARNING,
+                       "ds4-server: chat ctx=%s%s%s tool call rejected on type mismatch: %s",
+                       ctx_span,
+                       req_flags[0] ? " " : "",
+                       req_flags,
+                       rejected_reason);
+            trace_event(s, trace_id,
+                        "tool call rejected on type mismatch: %s", rejected_reason);
+            free(rejected_reason);
+        }
         if (!parsed_ok && recovered_tool_parse_failure && j->req.has_tools && saw_tool_start) {
             /* parse_generated_message failed even though DSML was present.
              * Semantic repair is intentionally avoided: if the parser cannot
@@ -14361,6 +14681,55 @@ static void test_responses_output_sends_tool_search_call_item(void) {
     free(schemas);
     tool_schema_orders_free(&orders);
     tool_calls_free(&calls);
+}
+
+static void test_dsml_schema_types_are_coerced_or_rejected(void) {
+    tool_schema_orders orders = {0};
+    tool_schema_orders_add_json(&orders,
+        "{\"name\":\"read\",\"input_schema\":{\"type\":\"object\",\"properties\":{"
+        "\"limit\":{\"type\":\"number\"},\"force\":{\"type\":\"boolean\"}}}}");
+
+    const char *valid =
+        DS4_TOOL_CALLS_START "\n"
+        DS4_INVOKE_START " name=\"read\">\n"
+        DS4_PARAM_START " name=\"limit\" string=\"true\">12" DS4_PARAM_END "\n"
+        DS4_PARAM_START " name=\"force\" string=\"true\">true" DS4_PARAM_END "\n"
+        DS4_INVOKE_END "\n" DS4_TOOL_CALLS_END;
+    const char *finish = "stop";
+    char err[160] = {0};
+    char *content = NULL, *reasoning = NULL, *coerced = NULL, *rejected = NULL;
+    tool_calls calls = {0};
+    bool recovered = false;
+    TEST_ASSERT(parse_generated_message_for_response_for_syntax_with_schema(
+        SERVER_MODEL_SYNTAX_DEEPSEEK, valid, true, true, false, &orders,
+        &finish, err, sizeof(err), &content, &reasoning, &calls, &recovered,
+        &coerced, &rejected));
+    TEST_ASSERT(calls.len == 1);
+    TEST_ASSERT(strstr(calls.v[0].arguments, "\"limit\": 12") != NULL);
+    TEST_ASSERT(strstr(calls.v[0].arguments, "\"force\": true") != NULL);
+    TEST_ASSERT(coerced && strstr(coerced, "read.limit=>number") != NULL);
+    TEST_ASSERT(rejected == NULL);
+    free(content); free(reasoning); free(coerced); free(rejected);
+    tool_calls_free(&calls);
+
+    const char *invalid =
+        DS4_TOOL_CALLS_START "\n"
+        DS4_INVOKE_START " name=\"read\">\n"
+        DS4_PARAM_START " name=\"limit\" string=\"true\">many" DS4_PARAM_END "\n"
+        DS4_INVOKE_END "\n" DS4_TOOL_CALLS_END;
+    finish = "stop";
+    content = reasoning = coerced = rejected = NULL;
+    recovered = false;
+    TEST_ASSERT(!parse_generated_message_for_response_for_syntax_with_schema(
+        SERVER_MODEL_SYNTAX_DEEPSEEK, invalid, true, true, false, &orders,
+        &finish, err, sizeof(err), &content, &reasoning, &calls, &recovered,
+        &coerced, &rejected));
+    TEST_ASSERT(recovered);
+    TEST_ASSERT(rejected && strstr(rejected, "must be a number") != NULL);
+    TEST_ASSERT(calls.len == 0);
+    free(content); free(reasoning); free(coerced); free(rejected);
+    tool_calls_free(&calls);
+    tool_schema_orders_free(&orders);
 }
 
 static tool_calls make_swapped_bash_call(void) {
@@ -18800,6 +19169,7 @@ static void ds4_server_unit_tests_run(void) {
     test_responses_input_tool_search_output_rejects_bad_tools();
     test_responses_input_function_call_namespace_round_trips_to_dsml();
     test_responses_output_sends_tool_search_call_item();
+    test_dsml_schema_types_are_coerced_or_rejected();
     test_dsml_tool_args_preserve_call_order();
     test_openai_tool_args_preserve_call_order();
     test_anthropic_thinking_and_tool_args_preserve_call_order();
