@@ -12,6 +12,7 @@
 #include <ctype.h>
 #include <dirent.h>
 #include <errno.h>
+#include <float.h>
 #include <math.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -529,6 +530,14 @@ static bool kv_cache_reason_is_anchor(uint8_t reason) {
            reason == DS4_KVSTORE_REASON_SHUTDOWN;
 }
 
+static bool kv_cache_entry_is_protected(
+        const ds4_kvstore_entry *e,
+        const ds4_kvstore_eviction_context *incoming) {
+    return e && incoming && incoming->protected_sha &&
+           incoming->protected_sha[0] &&
+           !strcmp(e->sha, incoming->protected_sha);
+}
+
 double ds4_kvstore_entry_eviction_score(
         const ds4_kvstore_entry *e,
         const ds4_tokens *live,
@@ -536,6 +545,7 @@ double ds4_kvstore_entry_eviction_score(
         const ds4_kvstore_eviction_context *incoming) {
     if (!e || e->file_size == 0) return 0.0;
     (void)live;
+    if (kv_cache_entry_is_protected(e, incoming)) return DBL_MAX;
     double effective_hits = (double)e->hits;
     uint64_t used_at = e->last_used ? e->last_used : e->created_at;
     if (used_at == 0) {
@@ -569,15 +579,14 @@ void ds4_kvstore_evict(ds4_kvstore *kc, const ds4_tokens *live,
     for (int i = 0; i < kc->len; i++) total += kc->entry[i].file_size;
     const uint64_t target = kc->budget_bytes - extra_bytes;
     while (total > target && kc->len > 0) {
-        int victim = 0;
-        double victim_score =
-            ds4_kvstore_entry_eviction_score(&kc->entry[0], live, now,
-                                             incoming);
-        for (int i = 1; i < kc->len; i++) {
+        int victim = -1;
+        double victim_score = 0.0;
+        for (int i = 0; i < kc->len; i++) {
+            if (kv_cache_entry_is_protected(&kc->entry[i], incoming)) continue;
             double score =
                 ds4_kvstore_entry_eviction_score(&kc->entry[i], live, now,
                                                  incoming);
-            if (score < victim_score ||
+            if (victim < 0 || score < victim_score ||
                 (score == victim_score &&
                  kc->entry[i].last_used < kc->entry[victim].last_used))
             {
@@ -585,6 +594,7 @@ void ds4_kvstore_evict(ds4_kvstore *kc, const ds4_tokens *live,
                 victim_score = score;
             }
         }
+        if (victim < 0) break;
         ds4_kvstore_entry e = kc->entry[victim];
         if (unlink(e.path) == 0) {
             kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
@@ -929,6 +939,7 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
                                         const char *cache_text_override,
                                         uint8_t cache_text_ext,
                                         const char *cache_text_key,
+                                        const char *protected_sha,
                                         const ds4_kvstore_trailer_hooks *hooks,
                                         char *err,
                                         size_t err_len) {
@@ -1048,6 +1059,7 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
         .quant_bits = (uint8_t)quant_bits,
         .ctx_size = (uint32_t)ds4_session_ctx(session),
         .reject_different_quant = kc->reject_different_quant,
+        .protected_sha = protected_sha,
     };
     ds4_kvstore_evict(kc, live_tokens, est_file_bytes, &incoming);
 
@@ -1165,7 +1177,7 @@ bool ds4_kvstore_store_live_prefix(ds4_kvstore *kc,
                                    size_t err_len) {
     return ds4_kvstore_store_live_prefix_text(kc, engine, session, tokens,
                                               store_len, reason, NULL, 0, NULL,
-                                              hooks, err, err_len);
+                                              NULL, hooks, err, err_len);
 }
 
 bool ds4_kvstore_maybe_store_continued(ds4_kvstore *kc,
