@@ -9402,6 +9402,29 @@ struct server_slot {
 static bool id_list_contains(const stop_list *ids, const char *id);
 static void id_list_push_unique(stop_list *ids, const char *id);
 
+typedef struct usage_model_stats {
+    char *model;
+    uint64_t prompt_tokens;
+    uint64_t completion_tokens;
+    uint64_t cached_tokens;
+    uint64_t cache_write_tokens;
+    uint64_t requests;
+    double prefill_duration;
+    double generation_duration;
+    struct usage_model_stats *next;
+} usage_model_stats;
+
+typedef struct {
+    uint64_t prompt_tokens;
+    uint64_t completion_tokens;
+    uint64_t cached_tokens;
+    uint64_t cache_write_tokens;
+    uint64_t requests;
+    double prefill_duration;
+    double generation_duration;
+    usage_model_stats *models;
+} usage_stats;
+
 struct server {
     ds4_engine *engine;
     server_slot *slots;
@@ -9437,6 +9460,11 @@ struct server {
     FILE *trace;
     pthread_mutex_t trace_mu;
     uint64_t trace_seq;
+    pthread_mutex_t usage_mu;
+    usage_stats usage;
+    char *usage_dir;
+    char *usage_log_path;
+    char *usage_stats_path;
 };
 
 static void server_inference_lock(server *s) {
@@ -10139,10 +10167,331 @@ static char *path_join(const char *dir, const char *name) {
     return ds4_kvstore_path_join(dir, name);
 }
 
+static const char *usage_api_name(api_style api) {
+    switch (api) {
+    case API_ANTHROPIC: return "anthropic";
+    case API_RESPONSES: return "openai-responses";
+    case API_OPENAI:
+    default: return "openai";
+    }
+}
 
+static const char *usage_endpoint_name(const request *r) {
+    if (!r) return "unknown";
+    if (r->api == API_ANTHROPIC) return "messages";
+    if (r->api == API_RESPONSES) return "responses";
+    return r->kind == REQ_CHAT ? "chat.completions" : "completions";
+}
 
+static usage_model_stats *usage_model_get(usage_stats *st, const char *model, bool create) {
+    const char *name = (model && model[0]) ? model : "unknown";
+    for (usage_model_stats *m = st->models; m; m = m->next) {
+        if (!strcmp(m->model, name)) return m;
+    }
+    if (!create) return NULL;
+    usage_model_stats *m = xmalloc(sizeof(*m));
+    memset(m, 0, sizeof(*m));
+    m->model = xstrdup(name);
+    m->next = st->models;
+    st->models = m;
+    return m;
+}
 
+static void usage_stats_add(usage_stats *st, const char *model,
+                            uint64_t prompt_tokens,
+                            uint64_t completion_tokens,
+                            uint64_t cached_tokens,
+                            uint64_t cache_write_tokens,
+                            double prefill_duration,
+                            double generation_duration) {
+    if (!st) return;
+    st->prompt_tokens += prompt_tokens;
+    st->completion_tokens += completion_tokens;
+    st->cached_tokens += cached_tokens;
+    st->cache_write_tokens += cache_write_tokens;
+    st->prefill_duration += prefill_duration;
+    st->generation_duration += generation_duration;
+    st->requests++;
 
+    usage_model_stats *m = usage_model_get(st, model, true);
+    m->prompt_tokens += prompt_tokens;
+    m->completion_tokens += completion_tokens;
+    m->cached_tokens += cached_tokens;
+    m->cache_write_tokens += cache_write_tokens;
+    m->prefill_duration += prefill_duration;
+    m->generation_duration += generation_duration;
+    m->requests++;
+}
+
+static void usage_stats_free(usage_stats *st) {
+    if (!st) return;
+    usage_model_stats *m = st->models;
+    while (m) {
+        usage_model_stats *next = m->next;
+        free(m->model);
+        free(m);
+        m = next;
+    }
+    memset(st, 0, sizeof(*st));
+}
+
+static bool usage_extract_u64(const char *line, const char *key, uint64_t *out) {
+    char pat[80];
+    snprintf(pat, sizeof(pat), "\"%s\":", key);
+    const char *p = strstr(line, pat);
+    if (!p) return false;
+    p += strlen(pat);
+    while (*p && isspace((unsigned char)*p)) p++;
+    char *end = NULL;
+    unsigned long long v = strtoull(p, &end, 10);
+    if (end == p) return false;
+    *out = (uint64_t)v;
+    return true;
+}
+
+static bool usage_extract_double(const char *line, const char *key, double *out) {
+    char pat[80];
+    snprintf(pat, sizeof(pat), "\"%s\":", key);
+    const char *p = strstr(line, pat);
+    if (!p) return false;
+    p += strlen(pat);
+    while (*p && isspace((unsigned char)*p)) p++;
+    char *end = NULL;
+    double v = strtod(p, &end);
+    if (end == p) return false;
+    *out = v;
+    return true;
+}
+
+static bool usage_extract_string(const char *line, const char *key, char **out) {
+    char pat[80];
+    snprintf(pat, sizeof(pat), "\"%s\":", key);
+    const char *p = strstr(line, pat);
+    if (!p) return false;
+    p += strlen(pat);
+    while (*p && isspace((unsigned char)*p)) p++;
+    if (*p != '"') return false;
+    p++;
+    buf b = {0};
+    while (*p && *p != '"') {
+        if (*p == '\\' && p[1]) {
+            p++;
+            switch (*p) {
+            case 'n': buf_putc(&b, '\n'); break;
+            case 'r': buf_putc(&b, '\r'); break;
+            case 't': buf_putc(&b, '\t'); break;
+            default: buf_putc(&b, *p); break;
+            }
+            p++;
+        } else {
+            buf_putc(&b, *p++);
+        }
+    }
+    if (*p != '"') {
+        buf_free(&b);
+        return false;
+    }
+    *out = buf_take(&b);
+    return true;
+}
+
+static void usage_load_from_jsonl(server *s) {
+    if (!s || !s->usage_log_path) return;
+    FILE *fp = fopen(s->usage_log_path, "r");
+    if (!fp) return;
+    char line[8192];
+    while (fgets(line, sizeof(line), fp)) {
+        char *model = NULL;
+        uint64_t prompt = 0, completion = 0, cached = 0, cache_write = 0;
+        double prefill = 0.0, generation = 0.0;
+        if (!usage_extract_string(line, "model", &model)) continue;
+        if (!usage_extract_u64(line, "prompt_tokens", &prompt)) { free(model); continue; }
+        (void)usage_extract_u64(line, "completion_tokens", &completion);
+        (void)usage_extract_u64(line, "cached_tokens", &cached);
+        if (!usage_extract_u64(line, "cache_write_tokens", &cache_write)) {
+            cache_write = prompt > cached ? prompt - cached : 0;
+        }
+        (void)usage_extract_double(line, "prefill_duration", &prefill);
+        (void)usage_extract_double(line, "generation_duration", &generation);
+        usage_stats_add(&s->usage, model, prompt, completion, cached,
+                        cache_write, prefill, generation);
+        free(model);
+    }
+    fclose(fp);
+    if (s->usage.requests) {
+        server_log(DS4_LOG_DEFAULT,
+                   "ds4-server: loaded usage stats from %s (%llu requests)",
+                   s->usage_log_path,
+                   (unsigned long long)s->usage.requests);
+    }
+}
+
+static void usage_write_stats_locked(server *s) {
+    if (!s || !s->usage_stats_path) return;
+    buf b = {0};
+    buf_puts(&b, "{\n");
+    buf_printf(&b, "  \"total_prompt_tokens\": %llu,\n",
+               (unsigned long long)s->usage.prompt_tokens);
+    buf_printf(&b, "  \"total_completion_tokens\": %llu,\n",
+               (unsigned long long)s->usage.completion_tokens);
+    buf_printf(&b, "  \"total_cached_tokens\": %llu,\n",
+               (unsigned long long)s->usage.cached_tokens);
+    buf_printf(&b, "  \"total_cache_write_tokens\": %llu,\n",
+               (unsigned long long)s->usage.cache_write_tokens);
+    buf_printf(&b, "  \"total_requests\": %llu,\n",
+               (unsigned long long)s->usage.requests);
+    buf_printf(&b, "  \"total_prefill_duration\": %.6f,\n",
+               s->usage.prefill_duration);
+    buf_printf(&b, "  \"total_generation_duration\": %.6f,\n",
+               s->usage.generation_duration);
+    buf_puts(&b, "  \"per_model\": {");
+    bool first = true;
+    for (usage_model_stats *m = s->usage.models; m; m = m->next) {
+        if (!first) buf_putc(&b, ',');
+        first = false;
+        buf_puts(&b, "\n    ");
+        json_escape(&b, m->model);
+        buf_puts(&b, ": {");
+        buf_printf(&b, "\"prompt_tokens\": %llu, ",
+                   (unsigned long long)m->prompt_tokens);
+        buf_printf(&b, "\"completion_tokens\": %llu, ",
+                   (unsigned long long)m->completion_tokens);
+        buf_printf(&b, "\"cached_tokens\": %llu, ",
+                   (unsigned long long)m->cached_tokens);
+        buf_printf(&b, "\"cache_write_tokens\": %llu, ",
+                   (unsigned long long)m->cache_write_tokens);
+        buf_printf(&b, "\"requests\": %llu, ",
+                   (unsigned long long)m->requests);
+        buf_printf(&b, "\"prefill_duration\": %.6f, ",
+                   m->prefill_duration);
+        buf_printf(&b, "\"generation_duration\": %.6f}",
+                   m->generation_duration);
+    }
+    if (!first) buf_putc(&b, '\n');
+    buf_puts(&b, "  }\n}\n");
+
+    size_t tmp_len = strlen(s->usage_stats_path) + 5;
+    char *tmp = xmalloc(tmp_len);
+    snprintf(tmp, tmp_len, "%s.tmp", s->usage_stats_path);
+    FILE *fp = fopen(tmp, "w");
+    if (!fp) {
+        server_log(DS4_LOG_WARNING,
+                   "ds4-server: failed to write usage stats %s: %s",
+                   tmp, strerror(errno));
+        free(tmp);
+        buf_free(&b);
+        return;
+    }
+    fwrite(b.ptr ? b.ptr : "", 1, b.len, fp);
+    if (fclose(fp) != 0 || rename(tmp, s->usage_stats_path) != 0) {
+        server_log(DS4_LOG_WARNING,
+                   "ds4-server: failed to publish usage stats %s: %s",
+                   s->usage_stats_path, strerror(errno));
+    }
+    free(tmp);
+    buf_free(&b);
+}
+
+static char *usage_default_dir(void) {
+    const char *home = getenv("HOME");
+    if (!home || !home[0]) return xstrdup(".dsv4");
+    return path_join(home, ".dsv4");
+}
+
+static void usage_init(server *s) {
+    if (!s) return;
+    const char *dir_env = getenv("DS4_USAGE_DIR");
+    const char *log_env = getenv("DS4_USAGE_LOG");
+    const char *stats_env = getenv("DS4_USAGE_STATS");
+    s->usage_dir = dir_env && dir_env[0] ? xstrdup(dir_env) : usage_default_dir();
+    if (mkdir(s->usage_dir, 0700) != 0 && errno != EEXIST) {
+        server_log(DS4_LOG_WARNING,
+                   "ds4-server: failed to create usage dir %s: %s",
+                   s->usage_dir, strerror(errno));
+    }
+    s->usage_log_path = log_env && log_env[0] ? xstrdup(log_env) : path_join(s->usage_dir, "usage.jsonl");
+    s->usage_stats_path = stats_env && stats_env[0] ? xstrdup(stats_env) : path_join(s->usage_dir, "stats.json");
+    usage_load_from_jsonl(s);
+    pthread_mutex_lock(&s->usage_mu);
+    usage_write_stats_locked(s);
+    pthread_mutex_unlock(&s->usage_mu);
+}
+
+static void usage_close(server *s) {
+    if (!s) return;
+    pthread_mutex_lock(&s->usage_mu);
+    usage_write_stats_locked(s);
+    pthread_mutex_unlock(&s->usage_mu);
+    usage_stats_free(&s->usage);
+    free(s->usage_dir);
+    free(s->usage_log_path);
+    free(s->usage_stats_path);
+    s->usage_dir = NULL;
+    s->usage_log_path = NULL;
+    s->usage_stats_path = NULL;
+}
+
+static void usage_record_request_complete(server *s, const request *r,
+                                          int prompt_tokens,
+                                          int completion_tokens,
+                                          const char *finish_reason,
+                                          double prefill_duration,
+                                          double generation_duration) {
+    if (!s || !r) return;
+    int cached = clamp_usage_tokens(r->cache_read_tokens, prompt_tokens);
+    int cache_write = clamp_usage_tokens(r->cache_write_tokens, prompt_tokens - cached);
+    if (cache_write == 0 && prompt_tokens > cached) cache_write = prompt_tokens - cached;
+
+    char ts[32];
+    time_t now = time(NULL);
+    struct tm tm_utc;
+    gmtime_r(&now, &tm_utc);
+    strftime(ts, sizeof(ts), "%Y-%m-%dT%H:%M:%SZ", &tm_utc);
+
+    pthread_mutex_lock(&s->usage_mu);
+    usage_stats_add(&s->usage, r->model,
+                    (uint64_t)prompt_tokens,
+                    (uint64_t)completion_tokens,
+                    (uint64_t)cached,
+                    (uint64_t)cache_write,
+                    prefill_duration,
+                    generation_duration);
+
+    if (s->usage_log_path) {
+        FILE *fp = fopen(s->usage_log_path, "a");
+        if (fp) {
+            buf b = {0};
+            buf_puts(&b, "{\"timestamp\":");
+            json_escape(&b, ts);
+            buf_puts(&b, ",\"server\":\"dsv4\",\"endpoint\":");
+            json_escape(&b, usage_endpoint_name(r));
+            buf_puts(&b, ",\"api\":");
+            json_escape(&b, usage_api_name(r->api));
+            buf_puts(&b, ",\"model\":");
+            json_escape(&b, r->model ? r->model : "unknown");
+            buf_printf(&b, ",\"prompt_tokens\":%d", prompt_tokens);
+            buf_printf(&b, ",\"completion_tokens\":%d", completion_tokens);
+            buf_printf(&b, ",\"cached_tokens\":%d", cached);
+            buf_printf(&b, ",\"cache_write_tokens\":%d", cache_write);
+            buf_printf(&b, ",\"prefill_duration\":%.6f", prefill_duration);
+            buf_printf(&b, ",\"generation_duration\":%.6f", generation_duration);
+            buf_puts(&b, ",\"stream\":");
+            buf_puts(&b, r->stream ? "true" : "false");
+            buf_puts(&b, ",\"finish_reason\":");
+            json_escape(&b, finish_reason ? finish_reason : "");
+            buf_puts(&b, "}\n");
+            fwrite(b.ptr ? b.ptr : "", 1, b.len, fp);
+            fclose(fp);
+            buf_free(&b);
+        } else {
+            server_log(DS4_LOG_WARNING,
+                       "ds4-server: failed to append usage log %s: %s",
+                       s->usage_log_path, strerror(errno));
+        }
+    }
+    usage_write_stats_locked(s);
+    pthread_mutex_unlock(&s->usage_mu);
+}
 
 static const char *find_next_dsml_tool_block(const char *p, const char **end_out) {
     struct block_form {
@@ -12903,13 +13252,14 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     ds4_session_set_progress(slot->session, NULL, NULL);
     ds4_session_set_display_progress(slot->session, NULL, NULL);
     if (!multimodal) kv_cache_maybe_store_continued(s, slot);
+    const double prefill_duration = now_sec() - t0;
     server_log(DS4_LOG_PREFILL,
                "ds4-server: %s ctx=%s%s%s prompt done %.3fs",
                j->req.kind == REQ_CHAT ? "chat" : "completion",
                ctx_span,
                req_flags[0] ? " " : "",
                req_flags,
-               now_sec() - t0);
+               prefill_duration);
     if (cold_store_len == prompt_for_sync->len) {
         if (!multimodal && kv_cache_store_live_prefix(s, slot, prompt_for_sync,
                                        cold_store_len, "cold")) {
@@ -13743,6 +14093,9 @@ decode_again:
             thinking_live_clear(s, slot);
         }
     }
+    usage_record_request_complete(s, &j->req, prompt_tokens, completion,
+                                  final_finish, prefill_duration,
+                                  now_sec() - decode_t0);
     if (j->req.kind == REQ_CHAT && j->req.has_tools) {
         char flags[80];
         log_flags(flags, sizeof(flags),
@@ -14184,7 +14537,19 @@ static void append_admin_stats_json(buf *b, server *s) {
                    a.generated_tokens, a.tok_s);
         comma = true;
     }
-    buf_puts(b, "]}]}}\n");
+    pthread_mutex_lock(&s->usage_mu);
+    buf_printf(b,
+               "]}]},\"usage\":{\"total_prompt_tokens\":%llu,"
+               "\"total_completion_tokens\":%llu,"
+               "\"total_cached_tokens\":%llu,"
+               "\"total_cache_write_tokens\":%llu,"
+               "\"total_requests\":%llu}}\n",
+               (unsigned long long)s->usage.prompt_tokens,
+               (unsigned long long)s->usage.completion_tokens,
+               (unsigned long long)s->usage.cached_tokens,
+               (unsigned long long)s->usage.cache_write_tokens,
+               (unsigned long long)s->usage.requests);
+    pthread_mutex_unlock(&s->usage_mu);
 }
 
 static bool send_admin_stats(server *s, int fd) {
@@ -14544,6 +14909,8 @@ static void server_close_resources(server *s) {
     }
     free(s->slot_threads);
     free(s->slots);
+    usage_close(s);
+    pthread_mutex_destroy(&s->usage_mu);
     pthread_mutex_destroy(&s->tool_mu);
     pthread_mutex_destroy(&s->kv_mu);
     pthread_mutex_destroy(&s->inference_mu);
@@ -14921,6 +15288,7 @@ int main(int argc, char **argv) {
     pthread_mutex_init(&s.model_mu, NULL);
     pthread_cond_init(&s.model_cv, NULL);
     pthread_mutex_init(&s.trace_mu, NULL);
+    pthread_mutex_init(&s.usage_mu, NULL);
 
     for (int i = 0; i < slot_count; i++)
         pthread_mutex_init(&s.slots[i].activity_mu, NULL);
@@ -14958,6 +15326,7 @@ int main(int argc, char **argv) {
                        "ds4-server: MTP speculative decoding is disabled while native session batching is active");
         }
     }
+    usage_init(&s);
     if (cfg.trace_path) {
         s.trace = fopen(cfg.trace_path, "w");
         if (!s.trace) {
@@ -20070,6 +20439,48 @@ static void test_responses_inline_image_content(void) {
     buf_free(&json);
 }
 
+static void test_usage_metrics_persist(void) {
+    char tmpl[] = "/tmp/ds4-usage-test.XXXXXX";
+    char *dir = mkdtemp(tmpl);
+    TEST_ASSERT(dir != NULL);
+    if (!dir) return;
+
+    server s = {0};
+    pthread_mutex_init(&s.usage_mu, NULL);
+    s.usage_dir = xstrdup(dir);
+    s.usage_log_path = path_join(dir, "usage.jsonl");
+    s.usage_stats_path = path_join(dir, "stats.json");
+    request r;
+    request_init(&r, REQ_CHAT, 64);
+    r.model = xstrdup("deepseek-v4-flash");
+    r.cache_read_tokens = 30;
+    r.cache_write_tokens = 70;
+    usage_record_request_complete(&s, &r, 100, 12, "stop", 1.5, 2.5);
+
+    FILE *fp = fopen(s.usage_stats_path, "r");
+    TEST_ASSERT(fp != NULL);
+    char stats[2048] = {0};
+    if (fp) {
+        fread(stats, 1, sizeof(stats) - 1, fp);
+        fclose(fp);
+    }
+    TEST_ASSERT(strstr(stats, "\"total_prompt_tokens\": 100") != NULL);
+    TEST_ASSERT(strstr(stats, "\"total_completion_tokens\": 12") != NULL);
+    TEST_ASSERT(strstr(stats, "\"total_cached_tokens\": 30") != NULL);
+    TEST_ASSERT(strstr(stats, "\"total_cache_write_tokens\": 70") != NULL);
+
+    char *log_path = xstrdup(s.usage_log_path);
+    char *stats_path = xstrdup(s.usage_stats_path);
+    request_free(&r);
+    usage_close(&s);
+    pthread_mutex_destroy(&s.usage_mu);
+    unlink(log_path);
+    unlink(stats_path);
+    free(log_path);
+    free(stats_path);
+    rmdir(dir);
+}
+
 static void test_admin_stats_reports_each_active_slot(void) {
     server s = {0};
     server_slot slots[2] = {0};
@@ -20092,6 +20503,7 @@ static void test_admin_stats_reports_each_active_slot(void) {
 }
 
 static void ds4_server_unit_tests_run(void) {
+    test_usage_metrics_persist();
     test_admin_stats_reports_each_active_slot();
     test_batched_prefill_round_robin();
     test_mixed_prefill_quantum_option();
