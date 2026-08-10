@@ -9068,6 +9068,21 @@ typedef struct {
     size_t visible_len;
 } visible_live_state;
 
+typedef enum {
+    SERVER_ACTIVITY_NONE = 0,
+    SERVER_ACTIVITY_PREFILL,
+    SERVER_ACTIVITY_DECODE,
+} server_activity_phase;
+
+typedef struct {
+    server_activity_phase phase;
+    int processed;
+    int total;
+    int generated_tokens;
+    double tok_s;
+    double eta;
+} server_activity;
+
 struct server_slot {
     server *srv;
     int id;
@@ -9076,6 +9091,8 @@ struct server_slot {
     live_tool_state anthropic_live;
     visible_live_state thinking_live;
     int continued_last_store_tokens;
+    pthread_mutex_t activity_mu;
+    server_activity activity;
 
     job *assigned;
     job *running;
@@ -9136,6 +9153,39 @@ static void server_inference_lock(server *s) {
 
 static void server_inference_unlock(server *s) {
     pthread_mutex_unlock(&s->inference_mu);
+}
+
+static void server_activity_clear(server_slot *slot) {
+    if (!slot) return;
+    pthread_mutex_lock(&slot->activity_mu);
+    memset(&slot->activity, 0, sizeof(slot->activity));
+    pthread_mutex_unlock(&slot->activity_mu);
+}
+
+static void server_activity_set_prefill(server_slot *slot, int processed,
+                                        int total, double tok_s, double eta) {
+    if (!slot) return;
+    pthread_mutex_lock(&slot->activity_mu);
+    slot->activity = (server_activity){
+        .phase = SERVER_ACTIVITY_PREFILL,
+        .processed = processed,
+        .total = total,
+        .tok_s = tok_s,
+        .eta = eta,
+    };
+    pthread_mutex_unlock(&slot->activity_mu);
+}
+
+static void server_activity_set_decode(server_slot *slot, int generated_tokens,
+                                       double tok_s) {
+    if (!slot) return;
+    pthread_mutex_lock(&slot->activity_mu);
+    slot->activity = (server_activity){
+        .phase = SERVER_ACTIVITY_DECODE,
+        .generated_tokens = generated_tokens,
+        .tok_s = tok_s,
+    };
+    pthread_mutex_unlock(&slot->activity_mu);
 }
 
 /* Jobs are stack-owned by the client thread.  A resident-slot worker signals
@@ -11432,6 +11482,11 @@ static void server_progress_cb(void *ud, const char *event, int current, int tot
     char flags[64];
     log_flags(flags, sizeof(flags), p->responses_protocol,
               p->has_tools, false, false, false);
+    double display_tps = chunk_tps > 0.0 ? chunk_tps : avg_tps;
+    double eta = display_tps > 0.0 ?
+        (double)(display_total - display_current) / display_tps : 0.0;
+    server_activity_set_prefill(p->slot, display_current, display_total,
+                                display_tps, eta);
     const char *phase = p->phase ? p->phase : "prefill";
     server_log(DS4_LOG_PREFILL,
                "ds4-server: %s ctx=%s%s%s %s chunk %d/%d (%.1f%%) chunk=%.2f t/s avg=%.2f t/s %.3fs",
@@ -12444,6 +12499,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
                ctx_span,
                req_flags[0] ? " " : "",
                req_flags);
+    server_activity_set_prefill(slot, 0, prompt_tokens - cached, 0.0, 0.0);
     ds4_session_set_progress(slot->session, server_progress_cb, &progress);
     ds4_session_set_display_progress(slot->session, server_progress_cb, &progress);
 
@@ -12577,6 +12633,8 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     snprintf(id, sizeof(id), "%s-%llu",
              j->req.kind == REQ_CHAT ? "chatcmpl" : "cmpl",
              (unsigned long long)response_seq);
+
+    server_activity_set_decode(slot, 0, 0.0);
 
     bool structured_stream = request_uses_structured_stream(&j->req);
     anthropic_stream anthropic_live = {0};
@@ -12790,6 +12848,10 @@ decode_again:
             size_t piece_len = 0;
             char *piece = ds4_token_text(s->engine, token, &piece_len);
             completion++;
+            double decode_elapsed = now_sec() - decode_t0;
+            server_activity_set_decode(
+                slot, completion,
+                decode_elapsed > 0.0 ? (double)completion / decode_elapsed : 0.0);
 
             trace_piece(s, trace_id, piece, piece_len);
             buf_append(&text, piece, piece_len);
@@ -13570,6 +13632,7 @@ static void *worker_main(void *arg) {
         job *j = dequeue(s);
         if (!j) break;
         generate_job(s, &s->slots[0], j);
+        server_activity_clear(&s->slots[0]);
         job_complete(j);
     }
     return NULL;
@@ -13592,6 +13655,7 @@ static void *slot_worker_main(void *arg) {
         pthread_mutex_unlock(&s->mu);
 
         generate_job(s, slot, j);
+        server_activity_clear(slot);
         job_complete(j);
 
         pthread_mutex_lock(&s->mu);
@@ -13768,6 +13832,49 @@ static bool send_models(server *s, int fd) {
     return ok;
 }
 
+static void append_admin_stats_json(buf *b, server *s) {
+    buf_puts(b, "{\"active_models\":{\"models\":[{\"id\":");
+    json_escape(b, s->engine && ds4_engine_is_glm_dsa(s->engine) ?
+                    "glm-5.2" : "deepseek-v4-flash");
+    buf_puts(b, ",\"prefilling\":[");
+    bool comma = false;
+    for (int i = 0; i < s->slot_count; i++) {
+        server_activity a;
+        pthread_mutex_lock(&s->slots[i].activity_mu);
+        a = s->slots[i].activity;
+        pthread_mutex_unlock(&s->slots[i].activity_mu);
+        if (a.phase != SERVER_ACTIVITY_PREFILL) continue;
+        if (comma) buf_putc(b, ',');
+        buf_printf(b,
+                   "{\"processed\":%d,\"total\":%d,\"speed\":%.6f,\"eta\":%.6f}",
+                   a.processed, a.total, a.tok_s, a.eta);
+        comma = true;
+    }
+    buf_puts(b, "],\"generating\":[");
+    comma = false;
+    for (int i = 0; i < s->slot_count; i++) {
+        server_activity a;
+        pthread_mutex_lock(&s->slots[i].activity_mu);
+        a = s->slots[i].activity;
+        pthread_mutex_unlock(&s->slots[i].activity_mu);
+        if (a.phase != SERVER_ACTIVITY_DECODE) continue;
+        if (comma) buf_putc(b, ',');
+        buf_printf(b,
+                   "{\"generated_tokens\":%d,\"tokens_per_second\":%.6f,\"elapsed_seconds\":1.0}",
+                   a.generated_tokens, a.tok_s);
+        comma = true;
+    }
+    buf_puts(b, "]}]}}\n");
+}
+
+static bool send_admin_stats(server *s, int fd) {
+    buf b = {0};
+    append_admin_stats_json(&b, s);
+    bool ok = http_response(fd, s->enable_cors, 200, "application/json", b.ptr);
+    buf_free(&b);
+    return ok;
+}
+
 static void client_done(server *s) {
     pthread_mutex_lock(&s->mu);
     if (s->clients > 0) s->clients--;
@@ -13891,6 +13998,11 @@ static void *client_main(void *arg) {
 
     if (!strcmp(hr.method, "GET") && !strcmp(hr.path, "/v1/models")) {
         send_models(s, fd);
+        http_request_free(&hr);
+        goto done;
+    }
+    if (!strcmp(hr.method, "GET") && !strcmp(hr.path, "/admin/api/stats")) {
+        send_admin_stats(s, fd);
         http_request_free(&hr);
         goto done;
     }
@@ -14108,6 +14220,7 @@ static void server_close_resources(server *s) {
         live_tool_state_free(&slot->anthropic_live);
         visible_live_free(&slot->thinking_live);
         if (slot->session) ds4_session_free(slot->session);
+        pthread_mutex_destroy(&slot->activity_mu);
     }
     free(s->slot_threads);
     free(s->slots);
@@ -14488,6 +14601,9 @@ int main(int argc, char **argv) {
     pthread_mutex_init(&s.model_mu, NULL);
     pthread_cond_init(&s.model_cv, NULL);
     pthread_mutex_init(&s.trace_mu, NULL);
+
+    for (int i = 0; i < slot_count; i++)
+        pthread_mutex_init(&s.slots[i].activity_mu, NULL);
 
     for (int i = 0; i < slot_count; i++) {
         server_slot *slot = &s.slots[i];
@@ -19585,7 +19701,29 @@ static void test_responses_inline_image_content(void) {
     buf_free(&json);
 }
 
+static void test_admin_stats_reports_each_active_slot(void) {
+    server s = {0};
+    server_slot slots[2] = {0};
+    s.slots = slots;
+    s.slot_count = 2;
+    for (int i = 0; i < 2; i++) pthread_mutex_init(&slots[i].activity_mu, NULL);
+
+    server_activity_set_prefill(&slots[0], 4096, 8192, 200.0, 20.48);
+    server_activity_set_decode(&slots[1], 12, 9.5);
+    buf b = {0};
+    append_admin_stats_json(&b, &s);
+    TEST_ASSERT(strstr(b.ptr, "\"id\":\"deepseek-v4-flash\"") != NULL);
+    TEST_ASSERT(strstr(b.ptr, "\"processed\":4096") != NULL);
+    TEST_ASSERT(strstr(b.ptr, "\"total\":8192") != NULL);
+    TEST_ASSERT(strstr(b.ptr, "\"generated_tokens\":12") != NULL);
+    TEST_ASSERT(strstr(b.ptr, "\"tokens_per_second\":9.500000") != NULL);
+    buf_free(&b);
+
+    for (int i = 0; i < 2; i++) pthread_mutex_destroy(&slots[i].activity_mu);
+}
+
 static void ds4_server_unit_tests_run(void) {
+    test_admin_stats_reports_each_active_slot();
     test_batched_prefill_round_robin();
     test_mixed_prefill_quantum_option();
     test_batched_live_continuation_slot_binding();
