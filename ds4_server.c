@@ -12298,14 +12298,14 @@ static bool restore_clean_prompt_frontier(server *s, server_slot *slot,
 }
 
 #ifdef DS4_SERVER_TEST
+/* Ordering-only adapter: every observed transition is emitted by the same
+ * abort_recovery_run used in production. No session, socket, or KV result is
+ * represented here; those require their own real integration or filesystem
+ * oracle. */
 static void abort_test_record(abort_test_result *r,
-                              abort_test_event_kind kind,
-                              int tokens) {
+                              abort_test_event_kind kind) {
     if (r->events_len >= sizeof(r->events) / sizeof(r->events[0])) return;
-    abort_test_event *e = &r->events[r->events_len++];
-    memset(e, 0, sizeof(*e));
-    e->kind = kind;
-    e->tokens = tokens;
+    r->events[r->events_len++].kind = kind;
 }
 
 typedef struct {
@@ -12315,65 +12315,35 @@ typedef struct {
 
 static void abort_test_mark_cancelled(void *ud) {
     abort_test_adapter *a = ud;
-    abort_test_record(a->out, ABORT_TEST_CANCEL, a->out->live_tokens);
+    abort_test_record(a->out, ABORT_TEST_CANCEL);
 }
 
 static void abort_test_clear_live_state(void *ud) {
     abort_test_adapter *a = ud;
-    abort_test_record(a->out, ABORT_TEST_CLEAR_LIVE_STATE,
-                      a->out->live_tokens);
-    a->out->protocol_live_entries = 0;
-    a->out->tool_memory_entries = 0;
+    abort_test_record(a->out, ABORT_TEST_CLEAR_LIVE_STATE);
 }
 
 static bool abort_test_load_clean_prefix(void *ud) {
     abort_test_adapter *a = ud;
-    if (a->in->eviction_pressure) {
-        abort_test_record(a->out, ABORT_TEST_STORE_DISPLACED,
-                          a->out->live_tokens);
-        snprintf(a->out->events[a->out->events_len - 1].protected_sha, 41,
-                 "%.40s", a->in->incoming_sha);
-    }
-    abort_test_record(a->out, ABORT_TEST_LOAD_CLEAN,
-                      a->in->clean_prefix_tokens);
-    abort_test_event *e = &a->out->events[a->out->events_len - 1];
-    e->consume = false;
-    snprintf(e->sha, sizeof(e->sha), "%.40s", a->in->incoming_sha);
-    snprintf(a->out->loaded_sha, sizeof(a->out->loaded_sha), "%.40s",
-             a->in->incoming_sha);
-    a->out->live_tokens = a->in->clean_prefix_tokens;
-    a->out->recovery_loads++;
-    return a->out->clean_checkpoint_exists;
+    abort_test_record(a->out, ABORT_TEST_LOAD_CLEAN);
+    return !a->in->load_fails;
 }
 
 static bool abort_test_replay_prompt(void *ud) {
     abort_test_adapter *a = ud;
-    abort_test_record(a->out, ABORT_TEST_REPLAY_PROMPT,
-                      a->in->prompt_tokens - a->in->clean_prefix_tokens);
-    if (a->in->replay_fails) return false;
-    a->out->live_tokens = a->in->prompt_tokens;
-    return true;
+    abort_test_record(a->out, ABORT_TEST_REPLAY_PROMPT);
+    return !a->in->replay_fails;
 }
 
 static void abort_test_invalidate(void *ud) {
     abort_test_adapter *a = ud;
-    abort_test_record(a->out, ABORT_TEST_INVALIDATE, 0);
-    a->out->live_tokens = 0;
-    a->out->live_invalidated = true;
+    abort_test_record(a->out, ABORT_TEST_INVALIDATE);
 }
 
 int ds4_server_test_abort_recovery_trace(const abort_test_input *input,
                                          abort_test_result *result) {
-    if (!input || !result || input->clean_prefix_tokens <= 0 ||
-        input->prompt_tokens < input->clean_prefix_tokens)
-        return -1;
-    result->live_tokens = input->partial_live_tokens;
-    result->clean_checkpoint_exists = true;
-    result->protocol_live_entries = input->generated_tool_call ? 1 : 0;
-    result->tool_memory_entries = input->generated_tool_call ? 1 : 0;
-    if (input->scenario == ABORT_TEST_FINAL_WRITE_FAILURE)
-        abort_test_record(result, ABORT_TEST_FINAL_WRITE, input->generated_tokens);
-
+    if (!input || !result) return -1;
+    result->oracle_scope = ABORT_TEST_ORACLE_SHARED_ORDERING_ONLY;
     abort_test_adapter adapter = {.in = input, .out = result};
     abort_recovery_actions actions = {
         .ud = &adapter,
@@ -15765,53 +15735,85 @@ static void test_responses_output_sends_tool_search_call_item(void) {
     tool_calls_free(&calls);
 }
 
-static void test_dsml_schema_types_are_coerced_or_rejected(void) {
+static void test_schema_typed_arg_case(const char *schema_type,
+                                       const char *value,
+                                       bool model_says_string,
+                                       bool expected_ok,
+                                       const char *expected_json) {
+    buf schema = {0};
+    buf_printf(&schema,
+        "{\"name\":\"typed\",\"input_schema\":{\"type\":\"object\","
+        "\"properties\":{\"value\":{\"type\":\"%s\"}}}}",
+        schema_type);
     tool_schema_orders orders = {0};
-    tool_schema_orders_add_json(&orders,
-        "{\"name\":\"read\",\"input_schema\":{\"type\":\"object\",\"properties\":{"
-        "\"limit\":{\"type\":\"number\"},\"force\":{\"type\":\"boolean\"}}}}");
+    tool_schema_orders_add_json(&orders, schema.ptr);
 
-    const char *valid =
+    buf generated = {0};
+    buf_printf(&generated,
         DS4_TOOL_CALLS_START "\n"
-        DS4_INVOKE_START " name=\"read\">\n"
-        DS4_PARAM_START " name=\"limit\" string=\"true\">12" DS4_PARAM_END "\n"
-        DS4_PARAM_START " name=\"force\" string=\"true\">true" DS4_PARAM_END "\n"
-        DS4_INVOKE_END "\n" DS4_TOOL_CALLS_END;
+        DS4_INVOKE_START " name=\"typed\">\n"
+        DS4_PARAM_START " name=\"value\" string=\"%s\">%s" DS4_PARAM_END "\n"
+        DS4_INVOKE_END "\n" DS4_TOOL_CALLS_END,
+        model_says_string ? "true" : "false", value);
+
     const char *finish = "stop";
     char err[160] = {0};
     char *content = NULL, *reasoning = NULL, *coerced = NULL, *rejected = NULL;
     tool_calls calls = {0};
     bool recovered = false;
-    TEST_ASSERT(parse_generated_message_for_response_for_syntax_with_schema(
-        SERVER_MODEL_SYNTAX_DEEPSEEK, valid, true, true, false, &orders,
+    bool ok = parse_generated_message_for_response_for_syntax_with_schema(
+        SERVER_MODEL_SYNTAX_DEEPSEEK, generated.ptr, true, true, false, &orders,
         &finish, err, sizeof(err), &content, &reasoning, &calls, &recovered,
-        &coerced, &rejected));
-    TEST_ASSERT(calls.len == 1);
-    TEST_ASSERT(strstr(calls.v[0].arguments, "\"limit\": 12") != NULL);
-    TEST_ASSERT(strstr(calls.v[0].arguments, "\"force\": true") != NULL);
-    TEST_ASSERT(coerced && strstr(coerced, "read.limit=>number") != NULL);
-    TEST_ASSERT(rejected == NULL);
-    free(content); free(reasoning); free(coerced); free(rejected);
-    tool_calls_free(&calls);
+        &coerced, &rejected);
 
-    const char *invalid =
-        DS4_TOOL_CALLS_START "\n"
-        DS4_INVOKE_START " name=\"read\">\n"
-        DS4_PARAM_START " name=\"limit\" string=\"true\">many" DS4_PARAM_END "\n"
-        DS4_INVOKE_END "\n" DS4_TOOL_CALLS_END;
-    finish = "stop";
-    content = reasoning = coerced = rejected = NULL;
-    recovered = false;
-    TEST_ASSERT(!parse_generated_message_for_response_for_syntax_with_schema(
-        SERVER_MODEL_SYNTAX_DEEPSEEK, invalid, true, true, false, &orders,
-        &finish, err, sizeof(err), &content, &reasoning, &calls, &recovered,
-        &coerced, &rejected));
-    TEST_ASSERT(recovered);
-    TEST_ASSERT(rejected && strstr(rejected, "must be a number") != NULL);
-    TEST_ASSERT(calls.len == 0);
-    free(content); free(reasoning); free(coerced); free(rejected);
+    if (ok != expected_ok) {
+        fprintf(stderr,
+                "schema typed arg mismatch: type=%s value=%s model_string=%d expected_ok=%d\n",
+                schema_type, value, model_says_string, expected_ok);
+    }
+    TEST_ASSERT(ok == expected_ok);
+    if (ok != expected_ok) goto cleanup;
+    if (expected_ok) {
+        TEST_ASSERT(calls.len == 1);
+        TEST_ASSERT(calls.len == 1 && expected_json &&
+                    strstr(calls.v[0].arguments, expected_json) != NULL);
+        TEST_ASSERT(!recovered);
+        TEST_ASSERT(rejected == NULL);
+    } else {
+        TEST_ASSERT(calls.len == 0);
+        TEST_ASSERT(recovered);
+        TEST_ASSERT(rejected && strstr(rejected, "Tool call rejected:") != NULL);
+        TEST_ASSERT(content && strstr(content, "Re-emit the tool call") != NULL);
+        TEST_ASSERT(!strcmp(err, "tool call rejected on type mismatch"));
+    }
+
+cleanup:
+    free(content);
+    free(reasoning);
+    free(coerced);
+    free(rejected);
     tool_calls_free(&calls);
     tool_schema_orders_free(&orders);
+    buf_free(&generated);
+    buf_free(&schema);
+}
+
+static void test_dsml_schema_types_are_coerced_or_rejected(void) {
+    test_schema_typed_arg_case("integer", "1.5", true, false, NULL);
+    test_schema_typed_arg_case("integer", "1.5", false, false, NULL);
+    test_schema_typed_arg_case("integer", "2", true, true, "\"value\": 2");
+    test_schema_typed_arg_case("integer", "2", false, true, "\"value\": 2");
+    test_schema_typed_arg_case("integer", "2.0", true, true, "\"value\": 2.0");
+    test_schema_typed_arg_case("number", "1.5", true, true, "\"value\": 1.5");
+    test_schema_typed_arg_case("number", "1.5", false, true, "\"value\": 1.5");
+
+    test_schema_typed_arg_case("boolean", "true", true, true, "\"value\": true");
+    test_schema_typed_arg_case("boolean", "false", true, true, "\"value\": false");
+    test_schema_typed_arg_case("boolean", "true", false, true, "\"value\": true");
+    test_schema_typed_arg_case("boolean", "false", false, true, "\"value\": false");
+    test_schema_typed_arg_case("boolean", "yes", true, false, NULL);
+    test_schema_typed_arg_case("boolean", "1", false, false, NULL);
+    test_schema_typed_arg_case("boolean", "\"true\"", false, false, NULL);
 }
 
 static tool_calls make_swapped_bash_call(void) {
