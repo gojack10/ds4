@@ -15862,6 +15862,11 @@ static void test_dsml_schema_types_are_coerced_or_rejected(void) {
     test_schema_typed_arg_case("integer", "2", true, true, "\"value\": 2");
     test_schema_typed_arg_case("integer", "2", false, true, "\"value\": 2");
     test_schema_typed_arg_case("integer", "2.0", true, true, "\"value\": 2.0");
+    test_schema_typed_arg_case("integer", "9007199254740992.5", true, false, NULL);
+    test_schema_typed_arg_case("integer", "9007199254740992.5", false, false, NULL);
+    test_schema_typed_arg_case("integer", "10e-1", true, true, "\"value\": 10e-1");
+    test_schema_typed_arg_case("integer", "1e-1", true, false, NULL);
+    test_schema_typed_arg_case("integer", "0e-999999", true, true, "\"value\": 0e-999999");
     test_schema_typed_arg_case("number", "1.5", true, true, "\"value\": 1.5");
     test_schema_typed_arg_case("number", "1.5", false, true, "\"value\": 1.5");
 
