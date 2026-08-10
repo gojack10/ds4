@@ -4,58 +4,33 @@
 #include <stdbool.h>
 #include <stddef.h>
 
-/* Test-only contract seam. Production supplies this under DS4_SERVER_TEST once
- * abort recovery exists; the missing definition is the intentional RED link. */
-typedef enum {
-    ABORT_TEST_PREFILL_DISCONNECT,
-    ABORT_TEST_FINAL_WRITE_FAILURE,
-} abort_test_scenario;
-
+/* This seam observes only the shared recovery callback ordering. It does not
+ * exercise generation, response writes, session payloads, or filesystem KV. */
 typedef enum {
     ABORT_TEST_CANCEL,
     ABORT_TEST_CLEAR_LIVE_STATE,
-    ABORT_TEST_STORE_DISPLACED,
     ABORT_TEST_LOAD_CLEAN,
     ABORT_TEST_REPLAY_PROMPT,
     ABORT_TEST_INVALIDATE,
-    ABORT_TEST_STORE_CONTINUED,
-    ABORT_TEST_REMEMBER_TOOL,
-    ABORT_TEST_REMEMBER_LIVE,
-    ABORT_TEST_FINAL_WRITE,
 } abort_test_event_kind;
 
 typedef struct {
     abort_test_event_kind kind;
-    int tokens;
-    bool generated;
-    bool consume;
-    char sha[41];
-    char protected_sha[41];
 } abort_test_event;
 
 typedef struct {
-    abort_test_scenario scenario;
-    int clean_prefix_tokens;
-    int prompt_tokens;
-    int partial_live_tokens;
-    int generated_tokens;
-    bool generated_tool_call;
-    bool checkpoint_oversized;
-    bool eviction_pressure;
+    bool load_fails;
     bool replay_fails;
-    char incoming_sha[41];
 } abort_test_input;
 
+enum {
+    ABORT_TEST_ORACLE_SHARED_ORDERING_ONLY = 1u,
+};
+
 typedef struct {
-    abort_test_event events[24];
+    abort_test_event events[8];
     size_t events_len;
-    int live_tokens;
-    int recovery_loads;
-    int protocol_live_entries;
-    int tool_memory_entries;
-    bool live_invalidated;
-    bool clean_checkpoint_exists;
-    char loaded_sha[41];
+    unsigned oracle_scope;
 } abort_test_result;
 
 extern int ds4_server_test_abort_recovery_trace(const abort_test_input *input,
@@ -6849,103 +6824,141 @@ static int abort_test_event_index(const abort_test_result *r,
     return -1;
 }
 
-static const abort_test_event *abort_test_event_find(
-        const abort_test_result *r, abort_test_event_kind kind) {
-    int i = abort_test_event_index(r, kind);
-    return i >= 0 ? &r->events[i] : NULL;
-}
-
-static bool abort_test_has_generated_continued_store(
-        const abort_test_result *r) {
-    for (size_t i = 0; i < r->events_len; i++) {
-        if (r->events[i].kind == ABORT_TEST_STORE_CONTINUED &&
-            r->events[i].generated) return true;
-    }
-    return false;
-}
-
 static bool abort_test_run(const abort_test_input *in, abort_test_result *out) {
     memset(out, 0, sizeof(*out));
     int rc = ds4_server_test_abort_recovery_trace(in, out);
     TEST_ASSERT(rc == 0);
+    TEST_ASSERT(out->oracle_scope == ABORT_TEST_ORACLE_SHARED_ORDERING_ONLY);
     return rc == 0;
 }
 
-static void test_abort_kv_recovery_contract(void) {
-    const char *sha = "0123456789abcdef0123456789abcdef01234567";
-    abort_test_input prefill = {
-        .scenario = ABORT_TEST_PREFILL_DISCONNECT,
-        .clean_prefix_tokens = 49152,
-        .prompt_tokens = 50096,
-        .partial_live_tokens = 49700,
-        .checkpoint_oversized = true,
-    };
-    snprintf(prefill.incoming_sha, sizeof(prefill.incoming_sha), "%s", sha);
-
-    /* A: cancellation restores the exact prompt and keeps clean disk/live state. */
-    abort_test_result a;
-    if (!abort_test_run(&prefill, &a)) return;
-    int cancel = abort_test_event_index(&a, ABORT_TEST_CANCEL);
-    int clear = abort_test_event_index(&a, ABORT_TEST_CLEAR_LIVE_STATE);
-    int load = abort_test_event_index(&a, ABORT_TEST_LOAD_CLEAN);
-    int replay = abort_test_event_index(&a, ABORT_TEST_REPLAY_PROMPT);
-    const abort_test_event *load_event = abort_test_event_find(&a, ABORT_TEST_LOAD_CLEAN);
+static void test_abort_recovery_ordering_contract(void) {
+    abort_test_input success = {0};
+    abort_test_result out;
+    if (!abort_test_run(&success, &out)) return;
+    int cancel = abort_test_event_index(&out, ABORT_TEST_CANCEL);
+    int clear = abort_test_event_index(&out, ABORT_TEST_CLEAR_LIVE_STATE);
+    int load = abort_test_event_index(&out, ABORT_TEST_LOAD_CLEAN);
+    int replay = abort_test_event_index(&out, ABORT_TEST_REPLAY_PROMPT);
     TEST_ASSERT(cancel >= 0 && clear > cancel && load > clear && replay > load);
-    TEST_ASSERT(load_event && !load_event->consume);
-    TEST_ASSERT(a.recovery_loads == 1);
-    TEST_ASSERT(a.clean_checkpoint_exists);
-    TEST_ASSERT(!a.live_invalidated);
-    TEST_ASSERT(a.protocol_live_entries == 0);
-    TEST_ASSERT(a.tool_memory_entries == 0);
-    TEST_ASSERT(a.live_tokens == prefill.prompt_tokens);
-    TEST_ASSERT(!strcmp(a.loaded_sha, sha));
+    TEST_ASSERT(abort_test_event_index(&out, ABORT_TEST_INVALIDATE) < 0);
 
-    abort_test_input replay_failure = prefill;
-    replay_failure.replay_fails = true;
-    abort_test_result failed;
-    TEST_ASSERT(abort_test_run(&replay_failure, &failed));
-    TEST_ASSERT(failed.live_invalidated);
+    abort_test_input load_failure = {.load_fails = true};
+    TEST_ASSERT(abort_test_run(&load_failure, &out));
+    cancel = abort_test_event_index(&out, ABORT_TEST_CANCEL);
+    clear = abort_test_event_index(&out, ABORT_TEST_CLEAR_LIVE_STATE);
+    load = abort_test_event_index(&out, ABORT_TEST_LOAD_CLEAN);
+    int invalidate = abort_test_event_index(&out, ABORT_TEST_INVALIDATE);
+    TEST_ASSERT(cancel >= 0 && clear > cancel && load > clear &&
+                invalidate > load);
+    TEST_ASSERT(abort_test_event_index(&out, ABORT_TEST_REPLAY_PROMPT) < 0);
 
-    /* B: generated streamed state is uncommitted when the final write fails. */
-    abort_test_input final = prefill;
-    final.scenario = ABORT_TEST_FINAL_WRITE_FAILURE;
-    final.partial_live_tokens = final.prompt_tokens + 32;
-    final.generated_tokens = 32;
-    final.generated_tool_call = true;
-    abort_test_result b;
-    if (!abort_test_run(&final, &b)) return;
-    int final_write = abort_test_event_index(&b, ABORT_TEST_FINAL_WRITE);
-    cancel = abort_test_event_index(&b, ABORT_TEST_CANCEL);
-    clear = abort_test_event_index(&b, ABORT_TEST_CLEAR_LIVE_STATE);
-    load = abort_test_event_index(&b, ABORT_TEST_LOAD_CLEAN);
-    replay = abort_test_event_index(&b, ABORT_TEST_REPLAY_PROMPT);
-    TEST_ASSERT(final_write >= 0 && cancel > final_write && clear > cancel &&
-                load > clear && replay > load);
-    TEST_ASSERT(!abort_test_has_generated_continued_store(&b));
-    TEST_ASSERT(abort_test_event_index(&b, ABORT_TEST_REMEMBER_TOOL) < 0);
-    TEST_ASSERT(abort_test_event_index(&b, ABORT_TEST_REMEMBER_LIVE) < 0);
-    TEST_ASSERT(b.tool_memory_entries == 0 && b.protocol_live_entries == 0);
-    TEST_ASSERT(b.live_tokens == final.prompt_tokens);
-    TEST_ASSERT(b.clean_checkpoint_exists && !b.live_invalidated);
+    abort_test_input replay_failure = {.replay_fails = true};
+    TEST_ASSERT(abort_test_run(&replay_failure, &out));
+    replay = abort_test_event_index(&out, ABORT_TEST_REPLAY_PROMPT);
+    invalidate = abort_test_event_index(&out, ABORT_TEST_INVALIDATE);
+    TEST_ASSERT(replay >= 0 && invalidate > replay);
+}
 
-    /* C: the same oversized checkpoint survives two independent aborts. */
-    abort_test_result c1, c2;
-    TEST_ASSERT(abort_test_run(&final, &c1));
-    TEST_ASSERT(c1.clean_checkpoint_exists && c1.recovery_loads == 1);
-    TEST_ASSERT(abort_test_run(&final, &c2));
-    TEST_ASSERT(c2.clean_checkpoint_exists && c2.recovery_loads == 1);
-    TEST_ASSERT(!strcmp(c1.loaded_sha, sha) && !strcmp(c2.loaded_sha, sha));
+static void test_real_kv_oversized_checkpoint_survives_two_hits(void) {
+    char tmpl[] = "/tmp/ds4-kv-repeat-hit-test.XXXXXX";
+    char *dir = mkdtemp(tmpl);
+    TEST_ASSERT(dir != NULL);
+    if (!dir) return;
 
-    /* D: displaced-live storage carries the incoming SHA through eviction. */
-    abort_test_input pressure = prefill;
-    pressure.eviction_pressure = true;
-    abort_test_result d;
-    if (!abort_test_run(&pressure, &d)) return;
-    const abort_test_event *store =
-        abort_test_event_find(&d, ABORT_TEST_STORE_DISPLACED);
-    TEST_ASSERT(store != NULL);
-    TEST_ASSERT(store && !strcmp(store->protected_sha, sha));
-    TEST_ASSERT(d.clean_checkpoint_exists);
+    const char *text = "oversized clean checkpoint prefix";
+    const char *prompt = "oversized clean checkpoint prefix and request suffix";
+    char sha[41];
+    sha1_bytes_hex(text, strlen(text), sha);
+    test_kv_text_stub_file(dir, text, KV_REASON_COLD, 49152, 4096);
+    char name[44];
+    snprintf(name, sizeof(name), "%.40s.kv", sha);
+    char *path = path_join(dir, name);
+
+    kv_disk_cache kc = {0};
+    kc.enabled = true;
+    kc.dir = xstrdup(dir);
+    kc.opt = kv_cache_default_options();
+    kc.budget_bytes = 1024;
+
+    for (uint32_t hit = 1; hit <= 2; hit++) {
+        int idx = ds4_kvstore_find_text_prefix(&kc, prompt, 0, 2, 32768);
+        TEST_ASSERT(idx >= 0);
+        TEST_ASSERT(idx >= 0 && !strcmp(kc.entry[idx].sha, sha));
+        TEST_ASSERT(access(path, F_OK) == 0);
+        TEST_ASSERT(idx >= 0 && ds4_kvstore_touch_file(
+            path, kc.entry[idx].hits + 1));
+
+        FILE *fp = fopen(path, "rb");
+        ds4_kvstore_entry header = {0};
+        uint32_t text_bytes = 0;
+        TEST_ASSERT(fp != NULL);
+        TEST_ASSERT(fp && ds4_kvstore_read_header(fp, &header, &text_bytes));
+        if (fp) fclose(fp);
+        TEST_ASSERT(header.hits == hit);
+        TEST_ASSERT(text_bytes == strlen(text));
+    }
+
+    struct stat st;
+    TEST_ASSERT(stat(path, &st) == 0);
+    TEST_ASSERT((uint64_t)st.st_size > kc.budget_bytes);
+    TEST_ASSERT(access(path, F_OK) == 0);
+
+    kv_cache_close(&kc);
+    unlink(path);
+    free(path);
+    rmdir(dir);
+}
+
+static void test_real_kv_eviction_protects_incoming_sha(void) {
+    char tmpl[] = "/tmp/ds4-kv-protected-evict-test.XXXXXX";
+    char *dir = mkdtemp(tmpl);
+    TEST_ASSERT(dir != NULL);
+    if (!dir) return;
+
+    const char *protected_text = "incoming clean checkpoint";
+    const char *victim_text = "eligible displaced checkpoint";
+    char protected_sha[41], victim_sha[41];
+    sha1_bytes_hex(protected_text, strlen(protected_text), protected_sha);
+    sha1_bytes_hex(victim_text, strlen(victim_text), victim_sha);
+    test_kv_text_stub_file(dir, protected_text, KV_REASON_COLD, 49152, 2048);
+    test_kv_text_stub_file(dir, victim_text, KV_REASON_UNKNOWN, 1024, 2048);
+
+    char protected_name[44], victim_name[44];
+    snprintf(protected_name, sizeof(protected_name), "%.40s.kv", protected_sha);
+    snprintf(victim_name, sizeof(victim_name), "%.40s.kv", victim_sha);
+    char *protected_path = path_join(dir, protected_name);
+    char *victim_path = path_join(dir, victim_name);
+
+    kv_disk_cache kc = {0};
+    kc.enabled = true;
+    kc.dir = xstrdup(dir);
+    kc.opt = kv_cache_default_options();
+    kc.budget_bytes = KV_CACHE_FIXED_HEADER + 4u +
+                      strlen(protected_text) + 2048u + 16u;
+    ds4_kvstore_eviction_context incoming = {
+        .protected_sha = protected_sha,
+    };
+    ds4_kvstore_evict(&kc, NULL, 0, &incoming);
+
+    TEST_ASSERT(access(protected_path, F_OK) == 0);
+    TEST_ASSERT(access(victim_path, F_OK) != 0);
+
+    kv_cache_close(&kc);
+    unlink(protected_path);
+    unlink(victim_path);
+    free(protected_path);
+    free(victim_path);
+    rmdir(dir);
+}
+
+/* generate_job_inner has no shared final-response finalizer seam. Prefill
+ * disconnect and final-write publication ordering therefore remain for a
+ * later real-model socket-disconnect integration test, not this unit group. */
+static void test_abort_kv_recovery_contract(void) {
+    test_abort_recovery_ordering_contract();
+    test_real_kv_oversized_checkpoint_survives_two_hits();
+    test_real_kv_eviction_protects_incoming_sha();
 }
 
 static void test_server_unit_group(void) {
@@ -6978,7 +6991,7 @@ static const ds4_test_entry test_entries[] = {
     {"--mtp-verify-depth", "mtp-verify-depth", "MTP speculative verify commits autoregressive-identical tokens at draft depth > 2", test_mtp_verify_depth},
     {"--dspark-verify-depth", "dspark-verify-depth", "DSpark speculative verify commits autoregressive-identical tokens at draft depth > 2", test_dspark_verify_depth},
 #endif
-    {"--abort-kv-contract", "abort-kv-contract", "abort recovery and repeated disk-KV reuse contract", test_abort_kv_recovery_contract},
+    {"--abort-kv-contract", "abort-kv-contract", "recovery ordering plus real disk-KV retention and eviction", test_abort_kv_recovery_contract},
     {"--server", "server", "server parser/rendering/cache unit tests", test_server_unit_group},
 };
 
