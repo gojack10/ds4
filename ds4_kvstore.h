@@ -86,6 +86,8 @@ typedef struct {
     uint8_t quant_bits;
     uint32_t ctx_size;
     bool reject_different_quant;
+    /* Optional checkpoint that must survive this eviction pass. */
+    const char *protected_sha;
 } ds4_kvstore_eviction_context;
 
 typedef struct {
@@ -168,6 +170,7 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
                                         const char *cache_text_override,
                                         uint8_t cache_text_ext,
                                         const char *cache_text_key,
+                                        const char *protected_sha,
                                         const ds4_kvstore_trailer_hooks *hooks,
                                         char *err,
                                         size_t err_len);

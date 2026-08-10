@@ -10131,7 +10131,8 @@ static bool kv_cache_store_live_prefix_text(server *s, server_slot *slot,
                                             int store_len, const char *reason,
                                             const char *cache_text_override,
                                             uint8_t cache_text_ext,
-                                            const char *cache_text_key) {
+                                            const char *cache_text_key,
+                                            const char *protected_sha) {
     if (!s || !slot) return false;
     char err[160] = {0};
     ds4_kvstore_trailer_hooks hooks = kv_cache_tool_map_hooks(s, NULL);
@@ -10143,6 +10144,7 @@ static bool kv_cache_store_live_prefix_text(server *s, server_slot *slot,
                                                   cache_text_override,
                                                   cache_text_ext,
                                                   cache_text_key,
+                                                  protected_sha,
                                                   &hooks, err, sizeof(err));
     pthread_mutex_unlock(&s->kv_mu);
     pthread_mutex_unlock(&s->inference_mu);
@@ -10153,11 +10155,12 @@ static bool kv_cache_store_live_prefix(server *s, server_slot *slot,
                                        const ds4_tokens *tokens,
                                        int store_len, const char *reason) {
     return kv_cache_store_live_prefix_text(s, slot, tokens, store_len, reason,
-                                           NULL, 0, NULL);
+                                           NULL, 0, NULL, NULL);
 }
 
-static void kv_cache_store_current(server *s, server_slot *slot,
-                                   const char *reason) {
+static void kv_cache_store_current_protected(server *s, server_slot *slot,
+                                             const char *reason,
+                                             const char *protected_sha) {
     if (!s || !slot) return;
     const ds4_tokens *tokens = ds4_session_tokens(slot->session);
     if (!tokens) return;
@@ -10192,11 +10195,18 @@ static void kv_cache_store_current(server *s, server_slot *slot,
      * tokenizes only the visible suffix that follows this key. */
     if (visible_text) {
         kv_cache_store_live_prefix_text(s, slot, tokens, tokens->len, reason,
-                                        visible_text, visible_ext, visible_key);
+                                        visible_text, visible_ext, visible_key,
+                                        protected_sha);
         free(visible_text);
     } else {
-        kv_cache_store_live_prefix(s, slot, tokens, tokens->len, reason);
+        kv_cache_store_live_prefix_text(s, slot, tokens, tokens->len, reason,
+                                        NULL, 0, NULL, protected_sha);
     }
+}
+
+static void kv_cache_store_current(server *s, server_slot *slot,
+                                   const char *reason) {
+    kv_cache_store_current_protected(s, slot, reason, NULL);
 }
 
 #ifdef DS4_SERVER_TEST
@@ -10282,6 +10292,28 @@ static int kv_cache_find_text_prefix(kv_disk_cache *kc, const char *prompt_text,
 }
 #endif
 
+static bool kv_cache_best_text_prefix_sha(server *s, server_slot *slot,
+                                          const char *prompt_text,
+                                          char sha_out[41], int *tokens_out) {
+    if (sha_out) sha_out[0] = '\0';
+    if (tokens_out) *tokens_out = 0;
+    if (!s || !slot || !s->kv.enabled || !prompt_text) return false;
+    const int quant_bits = ds4_engine_routed_quant_bits(s->engine);
+    if (quant_bits != 2 && quant_bits != 4) return false;
+
+    pthread_mutex_lock(&s->kv_mu);
+    int idx = ds4_kvstore_find_text_prefix(&s->kv, prompt_text,
+                                           ds4_engine_model_id(s->engine),
+                                           quant_bits,
+                                           ds4_session_ctx(slot->session));
+    if (idx >= 0) {
+        if (sha_out) snprintf(sha_out, 41, "%.40s", s->kv.entry[idx].sha);
+        if (tokens_out) *tokens_out = (int)s->kv.entry[idx].tokens;
+    }
+    pthread_mutex_unlock(&s->kv_mu);
+    return idx >= 0;
+}
+
 static int kv_cache_try_load_text(server *s, server_slot *slot,
                                   const char *prompt_text,
                                   ds4_tokens *effective_prompt,
@@ -10301,6 +10333,7 @@ static int kv_cache_try_load_text(server *s, server_slot *slot,
     pthread_mutex_unlock(&s->kv_mu);
     pthread_mutex_unlock(&s->inference_mu);
     if (loaded > 0) {
+        slot->continued_last_store_tokens = loaded;
         if (loaded_path_out && lr.path) *loaded_path_out = xstrdup(lr.path);
         if (loaded_ext_flags_out) *loaded_ext_flags_out = lr.ext_flags;
     }
@@ -11047,11 +11080,12 @@ static int server_next_prefill_slot_locked(const server *s) {
     return -1;
 }
 
-static bool server_prefill_enter(server *s, server_slot *slot) {
-    if (!s || !slot || slot_job_cancelled(slot)) return false;
+static bool server_prefill_enter(server *s, server_slot *slot,
+                                 bool recovery) {
+    if (!s || !slot || (!recovery && slot_job_cancelled(slot))) return false;
     if (!s->batched_mode) {
         pthread_mutex_lock(&s->inference_mu);
-        if (slot_job_cancelled(slot)) {
+        if (!recovery && slot_job_cancelled(slot)) {
             pthread_mutex_unlock(&s->inference_mu);
             return false;
         }
@@ -11061,12 +11095,12 @@ static bool server_prefill_enter(server *s, server_slot *slot) {
     pthread_mutex_lock(&s->model_mu);
     slot->prefill_waiting = true;
     pthread_cond_broadcast(&s->model_cv);
-    while (!g_stop_requested && !slot_job_cancelled(slot) &&
+    while (!g_stop_requested && (recovery || !slot_job_cancelled(slot)) &&
            (s->model_busy || s->decode_pending > 0 ||
             server_next_prefill_slot_locked(s) != slot->id)) {
         pthread_cond_wait(&s->model_cv, &s->model_mu);
     }
-    if (g_stop_requested || slot_job_cancelled(slot)) {
+    if (g_stop_requested || (!recovery && slot_job_cancelled(slot))) {
         slot->prefill_waiting = false;
         pthread_cond_broadcast(&s->model_cv);
         pthread_mutex_unlock(&s->model_mu);
@@ -11111,12 +11145,14 @@ static int server_prefill_quantum(server *s) {
  * non-matching prompt is first rebuilt to one quantum; a matching checkpoint
  * advances from its current frontier. Absolute positions remain session-local,
  * so compressor alignment is independent of scheduler order. */
-static int server_session_sync(server *s, server_slot *slot,
-                               const ds4_tokens *prompt,
-                               char *err, size_t errlen) {
+static int server_session_sync_impl(server *s, server_slot *slot,
+                                    const ds4_tokens *prompt,
+                                    char *err, size_t errlen,
+                                    bool recovery) {
     if (!s || !slot || !prompt) return 1;
     if (!s->batched_mode) {
-        if (!server_prefill_enter(s, slot)) return DS4_SESSION_SYNC_INTERRUPTED;
+        if (!server_prefill_enter(s, slot, recovery))
+            return DS4_SESSION_SYNC_INTERRUPTED;
         int rc = ds4_session_sync(slot->session, prompt, err, errlen);
         server_prefill_leave(s);
         return rc;
@@ -11129,7 +11165,7 @@ static int server_session_sync(server *s, server_slot *slot,
     int done = common == live && prompt->len >= live ? live : 0;
     bool called = false;
 
-    while (!g_stop_requested && !slot_job_cancelled(slot) &&
+    while (!g_stop_requested && (recovery || !slot_job_cancelled(slot)) &&
            (!called || done < prompt->len)) {
         int quantum = server_prefill_quantum(s);
         int target = done + quantum;
@@ -11138,7 +11174,8 @@ static int server_session_sync(server *s, server_slot *slot,
 
         ds4_tokens prefix = *prompt;
         prefix.len = target;
-        if (!server_prefill_enter(s, slot)) return DS4_SESSION_SYNC_INTERRUPTED;
+        if (!server_prefill_enter(s, slot, recovery))
+            return DS4_SESSION_SYNC_INTERRUPTED;
         int rc = ds4_session_sync(slot->session, &prefix, err, errlen);
         if (rc == 0) done = ds4_session_pos(slot->session);
         server_prefill_leave(s);
@@ -11150,8 +11187,24 @@ static int server_session_sync(server *s, server_slot *slot,
             return 1;
         }
     }
-    return (g_stop_requested || slot_job_cancelled(slot)) ?
+    return (g_stop_requested || (!recovery && slot_job_cancelled(slot))) ?
            DS4_SESSION_SYNC_INTERRUPTED : 0;
+}
+
+static int server_session_sync(server *s, server_slot *slot,
+                               const ds4_tokens *prompt,
+                               char *err, size_t errlen) {
+    return server_session_sync_impl(s, slot, prompt, err, errlen, false);
+}
+
+static int server_session_sync_recovery(server *s, server_slot *slot,
+                                        const ds4_tokens *prompt,
+                                        char *err, size_t errlen) {
+    job *running = slot ? slot->running : NULL;
+    ds4_session_set_cancel(slot->session, NULL, NULL);
+    int rc = server_session_sync_impl(s, slot, prompt, err, errlen, true);
+    if (running) ds4_session_set_cancel(slot->session, job_cancelled, running);
+    return rc;
 }
 
 static int server_session_sync_multimodal(server *s, server_slot *slot,
@@ -11163,7 +11216,7 @@ static int server_session_sync_multimodal(server *s, server_slot *slot,
         return server_session_sync(s, slot, prompt, err, errlen);
     if (!s || !slot || !prompt || !images) return 1;
     if (!s->batched_mode) {
-        if (!server_prefill_enter(s, slot)) return DS4_SESSION_SYNC_INTERRUPTED;
+        if (!server_prefill_enter(s, slot, false)) return DS4_SESSION_SYNC_INTERRUPTED;
         int rc = ds4_session_sync_multimodal(slot->session, prompt,
                                              images, image_count,
                                              err, errlen);
@@ -11196,7 +11249,7 @@ static int server_session_sync_multimodal(server *s, server_slot *slot,
         }
         ds4_tokens prefix = *prompt;
         prefix.len = target;
-        if (!server_prefill_enter(s, slot)) return DS4_SESSION_SYNC_INTERRUPTED;
+        if (!server_prefill_enter(s, slot, false)) return DS4_SESSION_SYNC_INTERRUPTED;
         int rc = ds4_session_sync_multimodal(slot->session, &prefix,
                                              images, prefix_images,
                                              err, errlen);
@@ -11395,6 +11448,249 @@ static void send_prefill_failure_response(server *s, const job *j,
     }
     http_error(j->fd, s->enable_cors, 500, err);
 }
+
+typedef struct {
+    void *ud;
+    void (*mark_cancelled)(void *ud);
+    void (*clear_live_state)(void *ud);
+    bool (*load_clean_prefix)(void *ud);
+    bool (*replay_prompt)(void *ud);
+    void (*invalidate)(void *ud);
+} abort_recovery_actions;
+
+/* One sequencing authority for production recovery and the deterministic test
+ * adapters: cancellation and provisional state clearing always precede a clean
+ * non-consuming load, exact prompt replay, and failure invalidation. */
+static bool abort_recovery_run(const abort_recovery_actions *a) {
+    if (!a || !a->mark_cancelled || !a->clear_live_state ||
+        !a->load_clean_prefix || !a->replay_prompt || !a->invalidate)
+        return false;
+    a->mark_cancelled(a->ud);
+    a->clear_live_state(a->ud);
+    if (!a->load_clean_prefix(a->ud) || !a->replay_prompt(a->ud)) {
+        a->invalidate(a->ud);
+        return false;
+    }
+    return true;
+}
+
+typedef struct {
+    server *s;
+    server_slot *slot;
+    job *j;
+    const request *req;
+    const ds4_tokens *prompt;
+    const char *ctx;
+    const char *reason;
+    uint64_t trace_id;
+    ds4_tokens loaded_prompt;
+    char *loaded_path;
+    int loaded_tokens;
+    char loaded_sha[41];
+    char error[160];
+} server_abort_recovery;
+
+static void server_abort_mark_cancelled(void *ud) {
+    server_abort_recovery *r = ud;
+    job_mark_cancelled(r->j);
+}
+
+static void server_abort_clear_live_state(void *ud) {
+    server_abort_recovery *r = ud;
+    request_live_state_clear(r->s, r->slot);
+}
+
+static bool server_abort_load_clean_prefix(void *ud) {
+    server_abort_recovery *r = ud;
+    if (!r->s->kv.enabled || !r->req->prompt_text ||
+        !r->req->prompt_text[0])
+        return false;
+
+    int prefix_tokens = 0;
+    kv_cache_best_text_prefix_sha(r->s, r->slot, r->req->prompt_text,
+                                  r->loaded_sha, &prefix_tokens);
+    (void)prefix_tokens;
+    /* The request remains broadly cancelled, but recovery I/O itself must not
+     * inherit that callback or the clean load would self-cancel. */
+    ds4_session_set_cancel(r->slot->session, NULL, NULL);
+    r->loaded_tokens = kv_cache_try_load_text(
+        r->s, r->slot, r->req->prompt_text, &r->loaded_prompt,
+        &r->loaded_path, NULL, r->req->api == API_RESPONSES);
+    ds4_session_set_cancel(r->slot->session, job_cancelled, r->j);
+    return r->loaded_tokens > 0;
+}
+
+static bool server_abort_replay_prompt(void *ud) {
+    server_abort_recovery *r = ud;
+    return server_session_sync_recovery(r->s, r->slot, r->prompt,
+                                        r->error, sizeof(r->error)) == 0 &&
+           ds4_session_pos(r->slot->session) == r->prompt->len;
+}
+
+static void server_abort_invalidate(void *ud) {
+    server_abort_recovery *r = ud;
+    r->slot->continued_last_store_tokens = 0;
+    pthread_mutex_lock(&r->s->kv_mu);
+    r->s->kv.continued_last_store_tokens = 0;
+    pthread_mutex_unlock(&r->s->kv_mu);
+    pthread_mutex_lock(&r->s->inference_mu);
+    ds4_session_invalidate(r->slot->session);
+    pthread_mutex_unlock(&r->s->inference_mu);
+}
+
+static bool restore_clean_prompt_frontier(server *s, server_slot *slot,
+                                          job *j,
+                                          const ds4_tokens *prompt,
+                                          const char *ctx,
+                                          uint64_t trace_id,
+                                          const char *reason) {
+    if (!s || !slot || !j || !prompt) return false;
+    ds4_session_set_progress(slot->session, NULL, NULL);
+    ds4_session_set_display_progress(slot->session, NULL, NULL);
+
+    server_abort_recovery r = {
+        .s = s,
+        .slot = slot,
+        .j = j,
+        .req = &j->req,
+        .prompt = prompt,
+        .ctx = ctx,
+        .reason = reason,
+        .trace_id = trace_id,
+    };
+    server_log(DS4_LOG_WARNING,
+               "ds4-server: request aborted; restoring clean prompt frontier ctx=%s prompt=%d reason=\"%s\"",
+               ctx ? ctx : "?", prompt->len,
+               reason && reason[0] ? reason : "request cancelled");
+    trace_event(s, trace_id,
+                "request aborted; restoring clean prompt frontier prompt=%d reason=%s",
+                prompt->len,
+                reason && reason[0] ? reason : "request cancelled");
+
+    abort_recovery_actions actions = {
+        .ud = &r,
+        .mark_cancelled = server_abort_mark_cancelled,
+        .clear_live_state = server_abort_clear_live_state,
+        .load_clean_prefix = server_abort_load_clean_prefix,
+        .replay_prompt = server_abort_replay_prompt,
+        .invalidate = server_abort_invalidate,
+    };
+    bool ok = abort_recovery_run(&actions);
+    if (ok) {
+        server_log(DS4_LOG_KVCACHE,
+                   "ds4-server: clean prompt frontier restored ctx=%s cached=%d replayed=%d target=%d file=%s",
+                   ctx ? ctx : "?", r.loaded_tokens,
+                   prompt->len - r.loaded_tokens, prompt->len,
+                   r.loaded_path ? r.loaded_path : "");
+        trace_event(s, trace_id,
+                    "clean prompt frontier restored: cached=%d replayed=%d target=%d file=%s",
+                    r.loaded_tokens, prompt->len - r.loaded_tokens, prompt->len,
+                    r.loaded_path ? r.loaded_path : "");
+    } else {
+        server_log(DS4_LOG_WARNING,
+                   "ds4-server: abort recovery invalidated slot=%d ctx=%s cached=%d target=%d error=\"%s\"",
+                   slot->id, ctx ? ctx : "?", r.loaded_tokens, prompt->len,
+                   r.error[0] ? r.error : "clean checkpoint load failed");
+        trace_event(s, trace_id,
+                    "abort recovery invalidated slot: cached=%d target=%d error=%s",
+                    r.loaded_tokens, prompt->len,
+                    r.error[0] ? r.error : "clean checkpoint load failed");
+    }
+    ds4_tokens_free(&r.loaded_prompt);
+    free(r.loaded_path);
+    return ok;
+}
+
+#ifdef DS4_SERVER_TEST
+static void abort_test_record(abort_test_result *r,
+                              abort_test_event_kind kind,
+                              int tokens) {
+    if (r->events_len >= sizeof(r->events) / sizeof(r->events[0])) return;
+    abort_test_event *e = &r->events[r->events_len++];
+    memset(e, 0, sizeof(*e));
+    e->kind = kind;
+    e->tokens = tokens;
+}
+
+typedef struct {
+    const abort_test_input *in;
+    abort_test_result *out;
+} abort_test_adapter;
+
+static void abort_test_mark_cancelled(void *ud) {
+    abort_test_adapter *a = ud;
+    abort_test_record(a->out, ABORT_TEST_CANCEL, a->out->live_tokens);
+}
+
+static void abort_test_clear_live_state(void *ud) {
+    abort_test_adapter *a = ud;
+    abort_test_record(a->out, ABORT_TEST_CLEAR_LIVE_STATE,
+                      a->out->live_tokens);
+    a->out->protocol_live_entries = 0;
+    a->out->tool_memory_entries = 0;
+}
+
+static bool abort_test_load_clean_prefix(void *ud) {
+    abort_test_adapter *a = ud;
+    if (a->in->eviction_pressure) {
+        abort_test_record(a->out, ABORT_TEST_STORE_DISPLACED,
+                          a->out->live_tokens);
+        snprintf(a->out->events[a->out->events_len - 1].protected_sha, 41,
+                 "%.40s", a->in->incoming_sha);
+    }
+    abort_test_record(a->out, ABORT_TEST_LOAD_CLEAN,
+                      a->in->clean_prefix_tokens);
+    abort_test_event *e = &a->out->events[a->out->events_len - 1];
+    e->consume = false;
+    snprintf(e->sha, sizeof(e->sha), "%.40s", a->in->incoming_sha);
+    snprintf(a->out->loaded_sha, sizeof(a->out->loaded_sha), "%.40s",
+             a->in->incoming_sha);
+    a->out->live_tokens = a->in->clean_prefix_tokens;
+    a->out->recovery_loads++;
+    return a->out->clean_checkpoint_exists;
+}
+
+static bool abort_test_replay_prompt(void *ud) {
+    abort_test_adapter *a = ud;
+    abort_test_record(a->out, ABORT_TEST_REPLAY_PROMPT,
+                      a->in->prompt_tokens - a->in->clean_prefix_tokens);
+    if (a->in->replay_fails) return false;
+    a->out->live_tokens = a->in->prompt_tokens;
+    return true;
+}
+
+static void abort_test_invalidate(void *ud) {
+    abort_test_adapter *a = ud;
+    abort_test_record(a->out, ABORT_TEST_INVALIDATE, 0);
+    a->out->live_tokens = 0;
+    a->out->live_invalidated = true;
+}
+
+int ds4_server_test_abort_recovery_trace(const abort_test_input *input,
+                                         abort_test_result *result) {
+    if (!input || !result || input->clean_prefix_tokens <= 0 ||
+        input->prompt_tokens < input->clean_prefix_tokens)
+        return -1;
+    result->live_tokens = input->partial_live_tokens;
+    result->clean_checkpoint_exists = true;
+    result->protocol_live_entries = input->generated_tool_call ? 1 : 0;
+    result->tool_memory_entries = input->generated_tool_call ? 1 : 0;
+    if (input->scenario == ABORT_TEST_FINAL_WRITE_FAILURE)
+        abort_test_record(result, ABORT_TEST_FINAL_WRITE, input->generated_tokens);
+
+    abort_test_adapter adapter = {.in = input, .out = result};
+    abort_recovery_actions actions = {
+        .ud = &adapter,
+        .mark_cancelled = abort_test_mark_cancelled,
+        .clear_live_state = abort_test_clear_live_state,
+        .load_clean_prefix = abort_test_load_clean_prefix,
+        .replay_prompt = abort_test_replay_prompt,
+        .invalidate = abort_test_invalidate,
+    };
+    (void)abort_recovery_run(&actions);
+    return 0;
+}
+#endif
 
 static char *build_tool_checkpoint_suffix(const request *r, const char *content,
                                           const char *reasoning, const tool_calls *calls) {
@@ -12015,10 +12311,20 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     if (cached == 0) slot->continued_last_store_tokens = 0;
     if (!multimodal && s->kv.enabled && cached == 0 &&
         old_pos >= s->kv.opt.min_tokens) {
-        /* Loading a disk snapshot replaces the live Metal session.  Persist the
-         * current checkpoint first, otherwise a cache hit for an older prefix
-         * would silently discard the newer conversation state. */
-        kv_cache_store_current(s, slot, "evict");
+        /* Loading a disk snapshot replaces the live Metal session. Persist the
+         * displaced checkpoint first, but never let that store evict the clean
+         * incoming prefix we are about to load. */
+        char incoming_sha[41] = {0};
+        int incoming_tokens = 0;
+        kv_cache_best_text_prefix_sha(s, slot, j->req.prompt_text,
+                                      incoming_sha, &incoming_tokens);
+        if (incoming_sha[0]) {
+            server_log(DS4_LOG_KVCACHE,
+                       "ds4-server: protecting incoming prefix tokens=%d sha=%.12s before displaced-live store",
+                       incoming_tokens, incoming_sha);
+        }
+        kv_cache_store_current_protected(s, slot, "evict",
+                                         incoming_sha[0] ? incoming_sha : NULL);
     }
     if (!multimodal && cached == 0) {
         disk_cached = kv_cache_try_load(s, slot, &j->req, &effective_prompt,
@@ -12147,19 +12453,25 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
         ds4_tokens prefix = {0};
         tokens_copy_prefix(&prefix, prompt_for_sync, cold_store_len);
         if (server_session_sync(s, slot, &prefix, err, sizeof(err)) != 0) {
-            ds4_tokens_free(&prefix);
-            ds4_tokens_free(&effective_prompt);
             ds4_session_set_progress(slot->session, NULL, NULL);
             ds4_session_set_display_progress(slot->session, NULL, NULL);
             kv_cache_slot_restore_suppressed(slot, suppressed_continued_last,
                                              cold_store_len);
-            kv_cache_discard_failed_disk_entry(s, slot, disk_cache_path);
-            free(disk_cache_path);
             if (job_cancelled(j)) {
-                request_live_state_clear(s, slot);
-                trace_event(s, trace_id, "cancelled during prefill");
+                /* Cancellation interrupted evaluation; the loaded checkpoint is
+                 * clean and remains reusable. Never unlink it as corrupt. */
+                free(disk_cache_path);
+                restore_clean_prompt_frontier(s, slot, j, prompt_for_sync,
+                                              ctx_span, trace_id,
+                                              "cancelled during prefill");
+                ds4_tokens_free(&prefix);
+                ds4_tokens_free(&effective_prompt);
                 return;
             }
+            kv_cache_discard_failed_disk_entry(s, slot, disk_cache_path);
+            free(disk_cache_path);
+            ds4_tokens_free(&prefix);
+            ds4_tokens_free(&effective_prompt);
             trace_event(s, trace_id, "prefill failed: %s", err);
             send_prefill_failure_response(s, j, &progress, ctx_span, req_flags, err);
             return;
@@ -12182,28 +12494,30 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
                                        err, sizeof(err)) :
         server_session_sync(s, slot, prompt_for_sync, err, sizeof(err));
     if (prompt_sync_rc != 0) {
-        ds4_tokens_free(&effective_prompt);
         ds4_session_set_progress(slot->session, NULL, NULL);
         ds4_session_set_display_progress(slot->session, NULL, NULL);
         kv_cache_slot_restore_suppressed(slot, suppressed_continued_last,
                                          cold_store_len);
-        kv_cache_discard_failed_disk_entry(s, slot, disk_cache_path);
-        free(disk_cache_path);
         if (job_cancelled(j)) {
-            request_live_state_clear(s, slot);
-            trace_event(s, trace_id, "cancelled during prefill");
+            free(disk_cache_path);
+            restore_clean_prompt_frontier(s, slot, j, prompt_for_sync,
+                                          ctx_span, trace_id,
+                                          "cancelled during prefill");
+            ds4_tokens_free(&effective_prompt);
             return;
         }
+        kv_cache_discard_failed_disk_entry(s, slot, disk_cache_path);
+        free(disk_cache_path);
+        ds4_tokens_free(&effective_prompt);
         trace_event(s, trace_id, "prefill failed: %s", err);
         send_prefill_failure_response(s, j, &progress, ctx_span, req_flags, err);
         return;
     }
     free(disk_cache_path);
     if (job_cancelled(j)) {
-        ds4_session_set_progress(slot->session, NULL, NULL);
-        ds4_session_set_display_progress(slot->session, NULL, NULL);
-        request_live_state_clear(s, slot);
-        trace_event(s, trace_id, "cancelled after prefill");
+        restore_clean_prompt_frontier(s, slot, j, prompt_for_sync,
+                                      ctx_span, trace_id,
+                                      "cancelled after prefill");
         ds4_tokens_free(&effective_prompt);
         return;
     }
@@ -12253,7 +12567,9 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
                        ctx_span,
                        req_flags[0] ? " " : "",
                        req_flags);
-            request_live_state_clear(s, slot);
+            restore_clean_prompt_frontier(s, slot, j, prompt_for_sync,
+                                          ctx_span, trace_id,
+                                          "stream closed during prefill");
             ds4_tokens_free(&effective_prompt);
             return;
         }
@@ -12268,7 +12584,9 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
                        ctx_span,
                        req_flags[0] ? " " : "",
                        req_flags);
-            request_live_state_clear(s, slot);
+            restore_clean_prompt_frontier(s, slot, j, prompt_for_sync,
+                                          ctx_span, trace_id,
+                                          "SSE headers failed");
             ds4_tokens_free(&effective_prompt);
             return;
         }
@@ -12278,7 +12596,9 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
                                       prompt_tokens, &anthropic_live)) {
             job_mark_cancelled(j);
             server_log(DS4_LOG_GENERATION, "ds4-server: chat ctx=%s anthropic stream start failed", ctx_span);
-            request_live_state_clear(s, slot);
+            restore_clean_prompt_frontier(s, slot, j, prompt_for_sync,
+                                          ctx_span, trace_id,
+                                          "Anthropic stream start failed");
             ds4_tokens_free(&effective_prompt);
             return;
         }
@@ -12286,7 +12606,9 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
             !sse_chunk(j->fd, &j->req, id, NULL, NULL)) {
             job_mark_cancelled(j);
             server_log(DS4_LOG_GENERATION, "ds4-server: chat ctx=%s openai role chunk failed", ctx_span);
-            request_live_state_clear(s, slot);
+            restore_clean_prompt_frontier(s, slot, j, prompt_for_sync,
+                                          ctx_span, trace_id,
+                                          "OpenAI role chunk failed");
             ds4_tokens_free(&effective_prompt);
             return;
         }
@@ -12302,7 +12624,9 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
                            req_flags[0] ? " " : "",
                            req_flags);
                 responses_stream_free(&responses_live);
-                request_live_state_clear(s, slot);
+                restore_clean_prompt_frontier(s, slot, j, prompt_for_sync,
+                                              ctx_span, trace_id,
+                                              "Responses created event failed");
                 ds4_tokens_free(&effective_prompt);
                 return;
             }
@@ -12348,8 +12672,12 @@ decode_again:
         dsml_decode_state dsml_state = j->req.kind == REQ_CHAT && j->req.has_tools ?
             dsml_tracker.decode : DSML_DECODE_OUTSIDE;
         const bool in_tool_call = dsml_decode_state_is_tool(dsml_state);
-        if (!(j->req.kind == REQ_CHAT && j->req.has_tools && (saw_tool_start || in_tool_call))) {
-            if (!multimodal) kv_cache_maybe_store_continued(s, slot);
+        if (!multimodal && !j->req.stream &&
+            !(j->req.kind == REQ_CHAT && j->req.has_tools &&
+              (saw_tool_start || in_tool_call))) {
+            /* Streamed generated tokens are provisional until the final write.
+             * Prompt-prefill checkpoints were already persisted before decode. */
+            kv_cache_maybe_store_continued(s, slot);
         }
         float temperature = j->req.temperature;
         int top_k = j->req.top_k;
@@ -12595,8 +12923,10 @@ decode_again:
     server_generation_leave(s);
 
     if (job_cancelled(j)) {
-        request_live_state_clear(s, slot);
         trace_event(s, trace_id, "cancelled during generation after %d tokens", completion);
+        restore_clean_prompt_frontier(s, slot, j, prompt_for_sync,
+                                      ctx_span, trace_id,
+                                      "cancelled during generation");
         anthropic_stream_free(&anthropic_live);
         openai_stream_free(&openai_live);
         responses_stream_free(&responses_live);
@@ -12709,8 +13039,10 @@ decode_again:
         free(tail);
     }
     if (job_cancelled(j)) {
-        request_live_state_clear(s, slot);
         trace_event(s, trace_id, "cancelled while flushing generation");
+        restore_clean_prompt_frontier(s, slot, j, prompt_for_sync,
+                                      ctx_span, trace_id,
+                                      "cancelled while flushing generation");
         anthropic_stream_free(&anthropic_live);
         openai_stream_free(&openai_live);
         responses_stream_free(&responses_live);
@@ -12824,8 +13156,10 @@ decode_again:
             }
         }
         if (job_cancelled(j)) {
-            request_live_state_clear(s, slot);
             trace_event(s, trace_id, "cancelled during response parsing");
+            restore_clean_prompt_frontier(s, slot, j, prompt_for_sync,
+                                          ctx_span, trace_id,
+                                          "cancelled during response parsing");
             free(parsed_content);
             free(parsed_reasoning);
             tool_calls_free(&parsed_calls);
@@ -12841,15 +13175,14 @@ decode_again:
             if (j->req.api == API_ANTHROPIC && j->req.stream)
                 apply_anthropic_stream_tool_ids(&parsed_calls, &anthropic_live);
             assign_tool_call_ids(s, &parsed_calls, j->req.api);
-            tool_memory_remember(s, &parsed_calls);
             final_finish = "tool_calls";
-        } else if (j->req.api == API_RESPONSES) {
-            responses_live_clear(s, slot);
         }
     }
     if (job_cancelled(j)) {
-        request_live_state_clear(s, slot);
         trace_event(s, trace_id, "cancelled before publishing response state");
+        restore_clean_prompt_frontier(s, slot, j, prompt_for_sync,
+                                      ctx_span, trace_id,
+                                      "cancelled before publishing response state");
         free(parsed_content);
         free(parsed_reasoning);
         tool_calls_free(&parsed_calls);
@@ -12867,62 +13200,6 @@ decode_again:
                  saw_tool_start, saw_tool_end,
                  parsed_content ? parsed_content : (text.ptr ? text.ptr : ""),
                  parsed_reasoning, &parsed_calls, now_sec() - t0);
-
-    if (j->req.api == API_RESPONSES) {
-        if (strcmp(final_finish, "error") && strcmp(final_finish, "length")) {
-            /* Store the post-turn visible transcript plus the live token
-             * frontier.  The next Responses request may replay only this
-             * visible surface, while the real session also contains hidden
-             * reasoning and exact sampled tool-call bytes. */
-            char *visible_suffix =
-                build_responses_visible_assistant_suffix(&j->req,
-                    parsed_content ? parsed_content : "",
-                    parsed_reasoning,
-                    &parsed_calls);
-            buf visible = {0};
-            buf_puts(&visible, j->req.prompt_text ? j->req.prompt_text : "");
-            buf_puts(&visible, visible_suffix ? visible_suffix : "");
-            responses_live_remember(s, slot, visible.ptr ? visible.ptr : "",
-                                    parsed_calls.len ? &parsed_calls : NULL);
-            buf_free(&visible);
-            free(visible_suffix);
-        } else {
-            responses_live_clear(s, slot);
-        }
-    }
-    if (j->req.api == API_ANTHROPIC) {
-        if (parsed_calls.len && strcmp(final_finish, "error") &&
-            strcmp(final_finish, "length"))
-        {
-            anthropic_live_remember(s, slot, &parsed_calls);
-        } else {
-            anthropic_live_clear(s, slot);
-        }
-    }
-
-    if (j->req.kind == REQ_CHAT && parsed_calls.len &&
-        j->req.api != API_RESPONSES &&
-        should_canonicalize_tool_checkpoint(s, &parsed_calls))
-    {
-        /* Chat/completions has no protocol object that binds the next request
-         * to this live KV state.  Canonicalize only the fallback tool-call
-         * path where we lack exact sampled DSML replay; when raw DSML is known,
-         * replaying those bytes keeps future prompts aligned without rebuilding
-         * hidden reasoning.  Responses deliberately skips this path because its
-         * previous_response_id contract binds the next turn to live state. */
-        canonicalize_tool_checkpoint(s, slot, j, ctx_span, trace_id,
-                                     parsed_content ? parsed_content : "",
-                                     parsed_reasoning, &parsed_calls);
-        thinking_live_clear(s, slot);
-    } else if (parsed_calls.len) {
-        thinking_live_clear(s, slot);
-    } else if (!parsed_calls.len &&
-               should_remember_thinking_checkpoint(&j->req, &thinking, final_finish)) {
-        remember_thinking_checkpoint(s, slot, j, ctx_span, trace_id,
-                                     parsed_content ? parsed_content : "");
-    } else if (!parsed_calls.len) {
-        thinking_live_clear(s, slot);
-    }
 
     bool response_ok = !job_cancelled(j);
     if (response_ok && j->req.stream) {
@@ -12978,17 +13255,69 @@ decode_again:
                                      prompt_tokens, completion);
     }
     if (job_cancelled(j)) response_ok = false;
-    if (!response_ok) {
-        job_mark_cancelled(j);
-        final_finish = "error";
-        snprintf(err, sizeof(err), "client disconnected");
-        request_live_state_clear(s, slot);
+    const bool failed_stream = j->req.stream && !strcmp(final_finish, "error");
+    if (!response_ok || failed_stream) {
+        if (!response_ok) {
+            final_finish = "error";
+            snprintf(err, sizeof(err), "client disconnected");
+        }
+        restore_clean_prompt_frontier(s, slot, j, prompt_for_sync,
+                                      ctx_span, trace_id,
+                                      err[0] ? err : "streamed request failed");
         server_log(DS4_LOG_DEFAULT,
-                   "ds4-server: %s ctx=%s%s%s client disconnected",
+                   "ds4-server: %s ctx=%s%s%s response not committed",
                    j->req.kind == REQ_CHAT ? "chat" : "completion",
                    ctx_span,
                    req_flags[0] ? " " : "",
                    req_flags);
+    } else {
+        /* Generated protocol/tool state is provisional until the response's
+         * final write succeeds. */
+        if (j->req.kind == REQ_CHAT && parsed_calls.len)
+            tool_memory_remember(s, &parsed_calls);
+
+        if (j->req.api == API_RESPONSES) {
+            if (strcmp(final_finish, "error") && strcmp(final_finish, "length")) {
+                char *visible_suffix =
+                    build_responses_visible_assistant_suffix(&j->req,
+                        parsed_content ? parsed_content : "",
+                        parsed_reasoning, &parsed_calls);
+                buf visible = {0};
+                buf_puts(&visible, j->req.prompt_text ? j->req.prompt_text : "");
+                buf_puts(&visible, visible_suffix ? visible_suffix : "");
+                responses_live_remember(s, slot, visible.ptr ? visible.ptr : "",
+                                        parsed_calls.len ? &parsed_calls : NULL);
+                buf_free(&visible);
+                free(visible_suffix);
+            } else {
+                responses_live_clear(s, slot);
+            }
+        }
+        if (j->req.api == API_ANTHROPIC) {
+            if (parsed_calls.len && strcmp(final_finish, "error") &&
+                strcmp(final_finish, "length"))
+                anthropic_live_remember(s, slot, &parsed_calls);
+            else
+                anthropic_live_clear(s, slot);
+        }
+
+        if (j->req.kind == REQ_CHAT && parsed_calls.len &&
+            j->req.api != API_RESPONSES &&
+            should_canonicalize_tool_checkpoint(s, &parsed_calls))
+        {
+            canonicalize_tool_checkpoint(s, slot, j, ctx_span, trace_id,
+                                         parsed_content ? parsed_content : "",
+                                         parsed_reasoning, &parsed_calls);
+            thinking_live_clear(s, slot);
+        } else if (parsed_calls.len) {
+            thinking_live_clear(s, slot);
+        } else if (should_remember_thinking_checkpoint(&j->req, &thinking,
+                                                       final_finish)) {
+            remember_thinking_checkpoint(s, slot, j, ctx_span, trace_id,
+                                         parsed_content ? parsed_content : "");
+        } else {
+            thinking_live_clear(s, slot);
+        }
     }
     if (j->req.kind == REQ_CHAT && j->req.has_tools) {
         char flags[80];
