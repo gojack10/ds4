@@ -19444,6 +19444,15 @@ static void test_kv_cache_file_size_must_fit_budget(void) {
     TEST_ASSERT(!kv_cache_file_size_fits(&kc, UINT64_MAX, 1, 0, NULL, NULL));
 }
 
+static void test_kv_cache_transient_reservation_caps_without_overflow(void) {
+    TEST_ASSERT(ds4_kvstore_transient_reservation(100, 200, 1000) == 300);
+    TEST_ASSERT(ds4_kvstore_transient_reservation(600, 500, 1000) == 1000);
+    TEST_ASSERT(ds4_kvstore_transient_reservation(UINT64_MAX, 1, 4096) == 4096);
+    TEST_ASSERT(ds4_kvstore_transient_reservation(UINT64_MAX - 5, 10,
+                                                  UINT64_MAX) == UINT64_MAX);
+    TEST_ASSERT(ds4_kvstore_transient_reservation(0, 0, 0) == 0);
+}
+
 static void test_sha1_bytes_hex_matches_known_vector(void) {
     char sha[41];
     sha1_bytes_hex("abc", 3, sha);
@@ -19887,6 +19896,119 @@ static void test_kv_cache_eviction_ignores_oversize_incoming(void) {
     kv_cache_close(&kc);
     unlink(old_path);
     free(old_path);
+    rmdir(dir);
+}
+
+static void test_kv_cache_precommit_preserves_fallback_and_protected(void) {
+    char tmpl[] = "/tmp/ds4-kv-precommit-protect-test.XXXXXX";
+    char *dir = mkdtemp(tmpl);
+    TEST_ASSERT(dir != NULL);
+    if (!dir) return;
+
+    const char *texts[] = {
+        "system: recoverable prefix",
+        "unrelated incoming checkpoint",
+        "unrelated eviction victim",
+    };
+    const uint8_t reasons[] = {
+        KV_REASON_CONTINUED, KV_REASON_COLD, KV_REASON_UNKNOWN,
+    };
+    const uint32_t tokens[] = {4096, 2048, 512};
+    const uint64_t payload_bytes = 2048;
+    char shas[3][41], *paths[3];
+    uint64_t file_bytes[3];
+    for (int i = 0; i < 3; i++) {
+        test_kv_text_stub_file(dir, texts[i], reasons[i], tokens[i],
+                               payload_bytes);
+        char name[44];
+        sha1_bytes_hex(texts[i], strlen(texts[i]), shas[i]);
+        snprintf(name, sizeof(name), "%.40s.kv", shas[i]);
+        paths[i] = path_join(dir, name);
+        file_bytes[i] = KV_CACHE_FIXED_HEADER + 4ull +
+                        strlen(texts[i]) + payload_bytes;
+    }
+
+    kv_disk_cache kc = {0};
+    kc.enabled = true;
+    kc.dir = xstrdup(dir);
+    kc.opt = kv_cache_default_options();
+    kc.budget_bytes = file_bytes[0] + file_bytes[1] + file_bytes[2];
+
+    const char *incoming_text = "system: recoverable prefix and new suffix";
+    int fallback = ds4_kvstore_find_text_prefix(&kc, incoming_text,
+                                                 0, 2, 32768);
+    TEST_ASSERT(fallback >= 0);
+    TEST_ASSERT(fallback >= 0 && !strcmp(kc.entry[fallback].sha, shas[0]));
+    char fallback_sha[41] = {0};
+    if (fallback >= 0) memcpy(fallback_sha, kc.entry[fallback].sha,
+                              sizeof(fallback_sha));
+    ds4_kvstore_eviction_context incoming = {
+        .text = incoming_text,
+        .text_len = strlen(incoming_text),
+        .model_id = 0,
+        .quant_bits = 2,
+        .ctx_size = 32768,
+        .protected_sha = shas[1],
+        .fallback_sha = fallback_sha,
+    };
+    kv_cache_evict(&kc, NULL, file_bytes[2], &incoming);
+
+    TEST_ASSERT(access(paths[0], F_OK) == 0);
+    TEST_ASSERT(access(paths[1], F_OK) == 0);
+    TEST_ASSERT(access(paths[2], F_OK) != 0);
+
+    kv_cache_close(&kc);
+    for (int i = 0; i < 3; i++) {
+        unlink(paths[i]);
+        free(paths[i]);
+    }
+    rmdir(dir);
+}
+
+static void test_kv_cache_precommit_does_not_prune_superseded(void) {
+    char tmpl[] = "/tmp/ds4-kv-precommit-no-prune-test.XXXXXX";
+    char *dir = mkdtemp(tmpl);
+    TEST_ASSERT(dir != NULL);
+    if (!dir) return;
+
+    const char *continued_text = "system: hello";
+    const char *shutdown_text = "system: hello world";
+    const char *incoming_text = "system: hello world and suffix";
+    test_kv_text_stub_file(dir, continued_text, KV_REASON_CONTINUED, 2048, 2048);
+    test_kv_text_stub_file(dir, shutdown_text, KV_REASON_SHUTDOWN, 4096, 2048);
+
+    const char *texts[] = {continued_text, shutdown_text};
+    char shas[2][41], *paths[2];
+    for (int i = 0; i < 2; i++) {
+        char name[44];
+        sha1_bytes_hex(texts[i], strlen(texts[i]), shas[i]);
+        snprintf(name, sizeof(name), "%.40s.kv", shas[i]);
+        paths[i] = path_join(dir, name);
+    }
+
+    kv_disk_cache kc = {0};
+    kc.enabled = true;
+    kc.dir = xstrdup(dir);
+    kc.opt = kv_cache_default_options();
+    kc.budget_bytes = 1024u * 1024u;
+    ds4_kvstore_eviction_context incoming = {
+        .text = incoming_text,
+        .text_len = strlen(incoming_text),
+        .model_id = 0,
+        .quant_bits = 2,
+        .ctx_size = 32768,
+        .fallback_sha = shas[1],
+    };
+    kv_cache_evict(&kc, NULL, 0, &incoming);
+
+    TEST_ASSERT(access(paths[0], F_OK) == 0);
+    TEST_ASSERT(access(paths[1], F_OK) == 0);
+
+    kv_cache_close(&kc);
+    for (int i = 0; i < 2; i++) {
+        unlink(paths[i]);
+        free(paths[i]);
+    }
     rmdir(dir);
 }
 
@@ -20640,6 +20762,7 @@ static void ds4_server_unit_tests_run(void) {
     test_kv_cache_continued_uses_aligned_frontiers();
     test_kv_cache_cold_store_suppresses_duplicate_continued_boundary();
     test_kv_cache_file_size_must_fit_budget();
+    test_kv_cache_transient_reservation_caps_without_overflow();
     test_sha1_bytes_hex_matches_known_vector();
     test_kv_cache_lookup_uses_longest_text_prefix();
     test_kv_cache_lookup_rejects_wrong_model();
@@ -20648,6 +20771,8 @@ static void ds4_server_unit_tests_run(void) {
     test_kv_cache_eviction_prefers_anchor_reason();
     test_kv_cache_eviction_reserves_requested_space();
     test_kv_cache_eviction_ignores_oversize_incoming();
+    test_kv_cache_precommit_preserves_fallback_and_protected();
+    test_kv_cache_precommit_does_not_prune_superseded();
     test_kv_cache_prunes_superseded_runtime_checkpoints();
     test_kv_cache_open_removes_only_abandoned_temps();
     test_kv_cache_eviction_keeps_smaller_context_prefix();
