@@ -572,6 +572,8 @@ static bool kv_cache_entry_is_protected(
     if (!e || !incoming) return false;
     return (incoming->protected_sha && incoming->protected_sha[0] &&
             !strcmp(e->sha, incoming->protected_sha)) ||
+           (incoming->fallback_sha && incoming->fallback_sha[0] &&
+            !strcmp(e->sha, incoming->fallback_sha)) ||
            (incoming->committed_sha && incoming->committed_sha[0] &&
             !strcmp(e->sha, incoming->committed_sha));
 }
@@ -886,6 +888,15 @@ bool ds4_kvstore_file_size_fits(const ds4_kvstore *kc,
     return required <= kc->budget_bytes;
 }
 
+uint64_t ds4_kvstore_transient_reservation(uint64_t payload_bytes,
+                                           uint64_t required_file_bytes,
+                                           uint64_t budget_bytes) {
+    if (payload_bytes >= budget_bytes ||
+        required_file_bytes > budget_bytes - payload_bytes)
+        return budget_bytes;
+    return payload_bytes + required_file_bytes;
+}
+
 static bool kv_cache_file_text_matches(const char *path, const char sha[41],
                                        const char *text, size_t text_len) {
     if (text_len > UINT32_MAX) return false;
@@ -1080,6 +1091,54 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
         return true;
     }
 
+    const uint64_t predicted_payload_bytes = ds4_session_payload_bytes(session);
+    uint64_t predicted_file_bytes = 0, predicted_required_bytes = 0;
+    if (predicted_payload_bytes != 0 &&
+        !ds4_kvstore_file_size_fits(kc, (uint64_t)text_len,
+                                    predicted_payload_bytes,
+                                    trailer_est_bytes,
+                                    &predicted_file_bytes,
+                                    &predicted_required_bytes))
+    {
+        kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
+                "%s: kv cache skipped tokens=%d reason=%s because predicted file size %.2f MiB (%.2f MiB with safety) exceeds budget %.2f MiB",
+                kv_log_name(kc),
+                store_tokens.len,
+                reason,
+                (double)predicted_file_bytes / (1024.0 * 1024.0),
+                (double)predicted_required_bytes / (1024.0 * 1024.0),
+                (double)kc->budget_bytes / (1024.0 * 1024.0));
+        free(text);
+        free(path);
+        ds4_tokens_free(&store_tokens);
+        return false;
+    }
+
+    char fallback_sha[41] = {0};
+    int fallback = ds4_kvstore_find_text_prefix(kc, text, model_id, quant_bits,
+                                                ds4_session_ctx(session));
+    if (fallback >= 0) memcpy(fallback_sha, kc->entry[fallback].sha,
+                              sizeof(fallback_sha));
+    ds4_kvstore_eviction_context precommit = {
+        .text = text,
+        .text_len = text_len,
+        .model_id = (uint8_t)model_id,
+        .quant_bits = (uint8_t)quant_bits,
+        .ctx_size = (uint32_t)ds4_session_ctx(session),
+        .reject_different_quant = kc->reject_different_quant,
+        .protected_sha = protected_sha,
+        .fallback_sha = fallback_sha[0] ? fallback_sha : NULL,
+    };
+
+    /* Precommit capacity eviction preserves the best recoverable fallback;
+     * publication precedes superseding it. */
+    if (predicted_payload_bytes != 0) {
+        uint64_t reservation = ds4_kvstore_transient_reservation(
+            predicted_payload_bytes, predicted_required_bytes,
+            kc->budget_bytes);
+        ds4_kvstore_evict(kc, live_tokens, reservation, &precommit);
+    }
+
     ds4_session_payload_file staged = {0};
     if (ds4_session_stage_payload(session, &staged,
                                   save_err, sizeof(save_err)) != 0) {
@@ -1117,8 +1176,14 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
         return false;
     }
 
-    /* Keep every valid checkpoint until its replacement is fully written and
-     * atomically published. Post-commit eviction restores the disk budget. */
+    if (predicted_payload_bytes == 0) {
+        ds4_kvstore_evict(kc, live_tokens, est_required_bytes, &precommit);
+    } else if (predicted_payload_bytes != payload_bytes) {
+        uint64_t reservation = ds4_kvstore_transient_reservation(
+            payload_bytes, est_required_bytes, kc->budget_bytes);
+        ds4_kvstore_evict(kc, live_tokens, reservation, &precommit);
+    }
+
     kv_buf tmpb = {0};
     kv_buf_printf(&tmpb, "%s.tmp.%ld", path, (long)getpid());
     char *tmp = kv_buf_take(&tmpb);

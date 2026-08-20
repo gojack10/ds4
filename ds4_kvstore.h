@@ -88,6 +88,7 @@ typedef struct {
     bool reject_different_quant;
     /* Optional checkpoints that must survive this eviction pass. */
     const char *protected_sha;
+    const char *fallback_sha;
     const char *committed_sha;
 } ds4_kvstore_eviction_context;
 
@@ -152,6 +153,9 @@ bool ds4_kvstore_file_size_fits(const ds4_kvstore *kc,
                                 uint64_t trailer_bytes,
                                 uint64_t *file_bytes_out,
                                 uint64_t *required_bytes_out);
+uint64_t ds4_kvstore_transient_reservation(uint64_t payload_bytes,
+                                           uint64_t required_file_bytes,
+                                           uint64_t budget_bytes);
 double ds4_kvstore_entry_eviction_score(const ds4_kvstore_entry *e,
                                         const ds4_tokens *live,
                                         uint64_t now,
