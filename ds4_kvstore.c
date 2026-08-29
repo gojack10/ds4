@@ -12,8 +12,6 @@
 #include <ctype.h>
 #include <dirent.h>
 #include <errno.h>
-#include <float.h>
-#include <math.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -42,20 +40,9 @@
 #define KV_CACHE_DEFAULT_BOUNDARY_TRIM_TOKENS 32
 #define KV_CACHE_DEFAULT_BOUNDARY_ALIGN_TOKENS 2048
 #define KV_CACHE_DEFAULT_CONTINUED_INTERVAL_TOKENS 10000
-/* Disk-hit counts are evidence that a checkpoint was useful, but only while
- * the workload still resembles the one that produced those hits. */
-#define KV_CACHE_MIN_EFFECTIVE_HITS 0.01
-/* A runtime checkpoint that is a strict prefix of a committed store is a
- * superseded waypoint on the same path. Continued checkpoints get a soft
- * scoring penalty before commit; after commit, continued and shutdown
- * waypoints are pruned outright. */
-#define KV_CACHE_CONTINUED_PREFIX_MIN_FACTOR 0.05
-#define KV_CACHE_CONTINUED_PREFIX_HIT_FACTOR 0.45
-/* Cold/evict/shutdown checkpoints are intentional anchors, not just automatic
- * waypoints in a single growing conversation. Give them a soft prior against
- * unrelated stores, while still allowing pressure, poor density, or a committed
- * replacement on the same path to evict them. */
-#define KV_CACHE_ANCHOR_REASON_SCORE_FACTOR 2.0
+/* Pressure eviction is least-recently-used. Reason and hit metadata remain in
+ * the durable format for compatibility and diagnostics, but must not let an old
+ * checkpoint outrank a newly saved or loaded active conversation. */
 
 typedef struct {
     char *ptr;
@@ -560,12 +547,6 @@ static bool kv_cache_incoming_supersedes_runtime_checkpoint(
     return !strcmp(prefix_sha, e->sha);
 }
 
-static bool kv_cache_reason_is_anchor(uint8_t reason) {
-    return reason == DS4_KVSTORE_REASON_COLD ||
-           reason == DS4_KVSTORE_REASON_EVICT ||
-           reason == DS4_KVSTORE_REASON_SHUTDOWN;
-}
-
 static bool kv_cache_entry_is_protected(
         const ds4_kvstore_entry *e,
         const ds4_kvstore_eviction_context *incoming) {
@@ -578,45 +559,13 @@ static bool kv_cache_entry_is_protected(
             !strcmp(e->sha, incoming->committed_sha));
 }
 
-double ds4_kvstore_entry_eviction_score(
-        const ds4_kvstore_entry *e,
-        const ds4_tokens *live,
-        uint64_t now,
-        const ds4_kvstore_eviction_context *incoming) {
-    if (!e || e->file_size == 0) return 0.0;
-    (void)live;
-    if (kv_cache_entry_is_protected(e, incoming)) return DBL_MAX;
-    double effective_hits = (double)e->hits;
-    uint64_t used_at = e->last_used ? e->last_used : e->created_at;
-    if (used_at == 0) {
-        effective_hits = 0.0;
-    } else if (now > used_at) {
-        double elapsed = (double)(now - used_at);
-        effective_hits *= exp2(-elapsed / (double)DS4_KVSTORE_HIT_HALF_LIFE_SECONDS);
-        if (effective_hits < KV_CACHE_MIN_EFFECTIVE_HITS) effective_hits = 0.0;
-    }
-    double score = (effective_hits + 1.0) *
-                   (double)e->tokens / (double)e->file_size;
-    if (kv_cache_reason_is_anchor(e->reason))
-        score *= KV_CACHE_ANCHOR_REASON_SCORE_FACTOR;
-    if (e->reason == DS4_KVSTORE_REASON_CONTINUED &&
-        kv_cache_incoming_supersedes_runtime_checkpoint(e, incoming))
-    {
-        double h = effective_hits > 0.0 ?
-            effective_hits / (effective_hits + 1.0) : 0.0;
-        score *= KV_CACHE_CONTINUED_PREFIX_MIN_FACTOR +
-                 KV_CACHE_CONTINUED_PREFIX_HIT_FACTOR * h;
-    }
-    return score;
-}
-
 void ds4_kvstore_evict(ds4_kvstore *kc, const ds4_tokens *live,
                        uint64_t extra_bytes,
                        const ds4_kvstore_eviction_context *incoming) {
     if (!kc->enabled || kc->budget_bytes == 0) return;
     if (extra_bytes > kc->budget_bytes) return;
+    (void)live;
     kv_cache_refresh(kc);
-    const uint64_t now = (uint64_t)time(NULL);
     uint64_t total = 0;
     for (int i = 0; i < kc->len; i++) total += kc->entry[i].file_size;
     if (incoming && incoming->committed_sha) {
@@ -646,18 +595,17 @@ void ds4_kvstore_evict(ds4_kvstore *kc, const ds4_tokens *live,
     const uint64_t target = kc->budget_bytes - extra_bytes;
     while (total > target && kc->len > 0) {
         int victim = -1;
-        double victim_score = 0.0;
+        uint64_t victim_used_at = 0;
         for (int i = 0; i < kc->len; i++) {
-            if (kv_cache_entry_is_protected(&kc->entry[i], incoming)) continue;
-            double score =
-                ds4_kvstore_entry_eviction_score(&kc->entry[i], live, now,
-                                                 incoming);
-            if (victim < 0 || score < victim_score ||
-                (score == victim_score &&
-                 kc->entry[i].last_used < kc->entry[victim].last_used))
+            ds4_kvstore_entry *e = &kc->entry[i];
+            if (kv_cache_entry_is_protected(e, incoming)) continue;
+            const uint64_t used_at = e->last_used ? e->last_used : e->created_at;
+            if (victim < 0 || used_at < victim_used_at ||
+                (used_at == victim_used_at &&
+                 e->created_at < kc->entry[victim].created_at))
             {
                 victim = i;
-                victim_score = score;
+                victim_used_at = used_at;
             }
         }
         if (victim < 0) break;
@@ -707,7 +655,7 @@ bool ds4_kvstore_open(ds4_kvstore *kc, const char *dir, uint64_t budget_mb,
     kv_cache_cleanup_stale_temps(kc);
     ds4_kvstore_evict(kc, NULL, 0, NULL);
     kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
-            "%s: KV disk cache %s (budget=%llu MiB, cross-quant=%s, min=%d, cold_max=%d, continued=%d, trim=%d, align=%d, hit_half_life=%llus)",
+            "%s: KV disk cache %s (budget=%llu MiB, cross-quant=%s, min=%d, cold_max=%d, continued=%d, trim=%d, align=%d, eviction=lru)",
             kv_log_name(kc),
             kc->dir,
             (unsigned long long)(kc->budget_bytes / (1024ull * 1024ull)),
@@ -716,8 +664,7 @@ bool ds4_kvstore_open(ds4_kvstore *kc, const char *dir, uint64_t budget_mb,
             kc->opt.cold_max_tokens,
             kc->opt.continued_interval_tokens,
             kc->opt.boundary_trim_tokens,
-            kc->opt.boundary_align_tokens,
-            (unsigned long long)DS4_KVSTORE_HIT_HALF_LIFE_SECONDS);
+            kc->opt.boundary_align_tokens);
     return true;
 }
 
@@ -938,6 +885,7 @@ static bool kv_cache_existing_compatible(ds4_kvstore *kc, const char *path,
                        e.quant_bits == (uint8_t)quant_bits) &&
                       e.ctx_size <= (uint32_t)ctx_size &&
                       kv_cache_file_text_matches(path, sha, text, text_len);
+    if (compatible) ds4_kvstore_touch_file(path, e.hits);
     ds4_kvstore_entry_free(&e);
     if (!compatible) {
         if (unlink(path) == 0) {

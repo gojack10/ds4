@@ -10,7 +10,6 @@
 
 #define DS4_KVSTORE_FIXED_HEADER 48u
 #define DS4_KVSTORE_DEFAULT_MB 4096
-#define DS4_KVSTORE_HIT_HALF_LIFE_SECONDS (6ull * 60ull * 60ull)
 
 #define DS4_KVSTORE_EXT_TOOL_MAP          (1u << 0)
 #define DS4_KVSTORE_EXT_RESPONSES_VISIBLE (1u << 1)
@@ -156,10 +155,6 @@ bool ds4_kvstore_file_size_fits(const ds4_kvstore *kc,
 uint64_t ds4_kvstore_transient_reservation(uint64_t payload_bytes,
                                            uint64_t required_file_bytes,
                                            uint64_t budget_bytes);
-double ds4_kvstore_entry_eviction_score(const ds4_kvstore_entry *e,
-                                        const ds4_tokens *live,
-                                        uint64_t now,
-                                        const ds4_kvstore_eviction_context *incoming);
 void ds4_kvstore_evict(ds4_kvstore *kc, const ds4_tokens *live,
                        uint64_t extra_bytes,
                        const ds4_kvstore_eviction_context *incoming);

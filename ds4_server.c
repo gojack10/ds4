@@ -9489,7 +9489,6 @@ static void apply_anthropic_stream_tool_ids(tool_calls *calls,
  */
 
 #define KV_CACHE_FIXED_HEADER DS4_KVSTORE_FIXED_HEADER
-#define KV_CACHE_HIT_HALF_LIFE_SECONDS DS4_KVSTORE_HIT_HALF_LIFE_SECONDS
 #define KV_EXT_TOOL_MAP DS4_KVSTORE_EXT_TOOL_MAP
 #define KV_EXT_RESPONSES_VISIBLE DS4_KVSTORE_EXT_RESPONSES_VISIBLE
 #define KV_EXT_THINKING_VISIBLE DS4_KVSTORE_EXT_THINKING_VISIBLE
@@ -10120,14 +10119,6 @@ static void kv_cache_restore_tool_memory_for_messages(server *s, const chat_msgs
     closedir(d);
     id_list_free(&wanted);
 }
-
-#ifdef DS4_SERVER_TEST
-static double kv_entry_eviction_score(const kv_entry *e, const ds4_tokens *live,
-                                      uint64_t now,
-                                      const ds4_kvstore_eviction_context *incoming) {
-    return ds4_kvstore_entry_eviction_score(e, live, now, incoming);
-}
-#endif
 
 #ifdef DS4_SERVER_TEST
 static void kv_cache_evict(kv_disk_cache *kc, const ds4_tokens *live,
@@ -18983,7 +18974,7 @@ static void test_kv_tool_map_restores_before_prompt_render(void) {
     rmdir(dir);
 }
 
-static void test_kv_cache_eviction_values_fresh_snapshots(void) {
+static void test_kv_cache_eviction_uses_lru(void) {
     char tmpl[] = "/tmp/ds4-kv-evict-test.XXXXXX";
     char *dir = mkdtemp(tmpl);
     TEST_ASSERT(dir != NULL);
@@ -18992,8 +18983,9 @@ static void test_kv_cache_eviction_values_fresh_snapshots(void) {
     const char *old_sha = "1111111111111111111111111111111111111111";
     const char *new_sha = "2222222222222222222222222222222222222222";
     uint64_t now = (uint64_t)time(NULL);
-    test_kv_stub_file(dir, old_sha, KV_REASON_UNKNOWN, 512, 0, now, 4096);
-    test_kv_stub_file(dir, new_sha, KV_REASON_UNKNOWN, 2048, 0, now, 2048);
+    uint64_t old = now > 100 ? now - 100 : 1;
+    test_kv_stub_file(dir, old_sha, KV_REASON_EVICT, 800000, 99, old, 4096);
+    test_kv_stub_file(dir, new_sha, KV_REASON_CONTINUED, 200000, 0, now, 2048);
 
     char old_name[44], new_name[44];
     snprintf(old_name, sizeof(old_name), "%.40s.kv", old_sha);
@@ -19019,7 +19011,7 @@ static void test_kv_cache_eviction_values_fresh_snapshots(void) {
     rmdir(dir);
 }
 
-static void test_kv_cache_eviction_prefers_anchor_reason(void) {
+static void test_kv_cache_eviction_ignores_anchor_reason(void) {
     char tmpl[] = "/tmp/ds4-kv-anchor-reason-test.XXXXXX";
     char *dir = mkdtemp(tmpl);
     TEST_ASSERT(dir != NULL);
@@ -19028,7 +19020,8 @@ static void test_kv_cache_eviction_prefers_anchor_reason(void) {
     const char *anchor_sha = "1111111111111111111111111111111111111111";
     const char *continued_sha = "2222222222222222222222222222222222222222";
     uint64_t now = (uint64_t)time(NULL);
-    test_kv_stub_file(dir, anchor_sha, KV_REASON_COLD, 2048, 0, now, 2048);
+    uint64_t old = now > 100 ? now - 100 : 1;
+    test_kv_stub_file(dir, anchor_sha, KV_REASON_COLD, 2048, 0, old, 2048);
     test_kv_stub_file(dir, continued_sha, KV_REASON_CONTINUED, 2048, 0, now, 2048);
 
     char anchor_name[44], continued_name[44];
@@ -19044,8 +19037,8 @@ static void test_kv_cache_eviction_prefers_anchor_reason(void) {
     kc.budget_bytes = (KV_CACHE_FIXED_HEADER + 4u + 2048u) + 16u;
     kv_cache_evict(&kc, NULL, 0, NULL);
 
-    TEST_ASSERT(access(anchor_path, F_OK) == 0);
-    TEST_ASSERT(access(continued_path, F_OK) != 0);
+    TEST_ASSERT(access(anchor_path, F_OK) != 0);
+    TEST_ASSERT(access(continued_path, F_OK) == 0);
 
     kv_cache_close(&kc);
     unlink(anchor_path);
@@ -19313,75 +19306,7 @@ static void test_kv_cache_open_removes_only_abandoned_temps(void) {
     rmdir(dir);
 }
 
-static void test_kv_cache_eviction_keeps_smaller_context_prefix(void) {
-    char tmpl[] = "/tmp/ds4-kv-prefix-ctx-test.XXXXXX";
-    char *dir = mkdtemp(tmpl);
-    TEST_ASSERT(dir != NULL);
-    if (!dir) return;
-
-    const char *continued_text = "system: hello world";
-    const char *cold_text = "different stable prefix";
-    const char *incoming_text = "system: hello world\nuser: prompt";
-    test_kv_text_stub_file(dir, continued_text, KV_REASON_CONTINUED, 4096, 2048);
-    test_kv_text_stub_file(dir, cold_text, KV_REASON_COLD, 1024, 2048);
-
-    char continued_sha[41], cold_sha[41];
-    sha1_bytes_hex(continued_text, strlen(continued_text), continued_sha);
-    sha1_bytes_hex(cold_text, strlen(cold_text), cold_sha);
-    char continued_name[44], cold_name[44];
-    snprintf(continued_name, sizeof(continued_name), "%.40s.kv", continued_sha);
-    snprintf(cold_name, sizeof(cold_name), "%.40s.kv", cold_sha);
-    char *continued_path = path_join(dir, continued_name);
-    char *cold_path = path_join(dir, cold_name);
-
-    kv_disk_cache kc = {0};
-    kc.enabled = true;
-    kc.dir = xstrdup(dir);
-    kc.opt = kv_cache_default_options();
-    uint64_t incoming_bytes =
-        KV_CACHE_FIXED_HEADER + 4u + strlen(incoming_text) + 2048u;
-    kc.budget_bytes =
-        incoming_bytes + KV_CACHE_FIXED_HEADER + 4u + strlen(continued_text) + 2048u;
-    ds4_kvstore_eviction_context incoming = {
-        .text = incoming_text,
-        .text_len = strlen(incoming_text),
-        .model_id = 0,
-        .quant_bits = 2,
-        .ctx_size = 65536,
-        .reject_different_quant = false,
-    };
-    kv_cache_evict(&kc, NULL, incoming_bytes, &incoming);
-
-    TEST_ASSERT(access(continued_path, F_OK) == 0);
-    TEST_ASSERT(access(cold_path, F_OK) != 0);
-
-    kv_cache_close(&kc);
-    unlink(continued_path);
-    unlink(cold_path);
-    free(continued_path);
-    free(cold_path);
-    rmdir(dir);
-}
-
-static void test_kv_cache_eviction_score_decays_stale_hits(void) {
-    /* stale: lower tokens-per-byte (e.g. tool-heavy prompt) but boosted by
-     * 10 hits well in the past.  fresh: higher tokens-per-byte and zero hits,
-     * just stored.  The stale hit bonus decays by inactivity, so fresh wins on
-     * its better baseline even though stale once had more successful hits. */
-    const uint64_t now = 1000u + 14u * KV_CACHE_HIT_HALF_LIFE_SECONDS;
-    kv_entry stale = {.tokens = 1024, .hits = 10, .file_size = 4096, .last_used = 1000};
-    kv_entry fresh = {.tokens = 2048, .hits = 0,  .file_size = 4096, .last_used = now};
-
-    double s_on = kv_entry_eviction_score(&stale, NULL, now, NULL);
-    double f_on = kv_entry_eviction_score(&fresh, NULL, now, NULL);
-    TEST_ASSERT(s_on < f_on);
-
-    /* A fresh entry's score never decays below its (0+1) * tokens/size floor,
-     * regardless of how old another entry's hit history is. */
-    TEST_ASSERT(f_on == 1.0 * (double)fresh.tokens / (double)fresh.file_size);
-}
-
-static void test_kv_cache_eviction_decayed_hits_tie_break_by_age(void) {
+static void test_kv_cache_eviction_ignores_hits(void) {
     char tmpl[] = "/tmp/ds4-kv-stale-hit-evict-test.XXXXXX";
     char *dir = mkdtemp(tmpl);
     TEST_ASSERT(dir != NULL);
@@ -19390,9 +19315,7 @@ static void test_kv_cache_eviction_decayed_hits_tie_break_by_age(void) {
     const char *old_sha = "1111111111111111111111111111111111111111";
     const char *new_sha = "2222222222222222222222222222222222222222";
     uint64_t now = (uint64_t)time(NULL);
-    uint64_t stale = now > KV_CACHE_HIT_HALF_LIFE_SECONDS * 14ull
-        ? now - KV_CACHE_HIT_HALF_LIFE_SECONDS * 14ull
-        : 1;
+    uint64_t stale = now > 100 ? now - 100 : 1;
     test_kv_stub_file(dir, old_sha, KV_REASON_COLD, 2048, 15, stale, 2048);
     test_kv_stub_file(dir, new_sha, KV_REASON_COLD, 2048, 0, now, 2048);
 
@@ -19420,7 +19343,7 @@ static void test_kv_cache_eviction_decayed_hits_tie_break_by_age(void) {
     rmdir(dir);
 }
 
-static void test_kv_cache_eviction_keeps_aligned_continued_frontiers(void) {
+static void test_kv_cache_eviction_keeps_recent_continued_frontier(void) {
     char tmpl[] = "/tmp/ds4-kv-live-prefix-test.XXXXXX";
     char *dir = mkdtemp(tmpl);
     TEST_ASSERT(dir != NULL);
@@ -19429,7 +19352,8 @@ static void test_kv_cache_eviction_keeps_aligned_continued_frontiers(void) {
     const char *cold_sha = "1111111111111111111111111111111111111111";
     const char *continued_sha = "2222222222222222222222222222222222222222";
     uint64_t now = (uint64_t)time(NULL);
-    test_kv_stub_file(dir, cold_sha, KV_REASON_COLD, 512, 0, now, 2048);
+    uint64_t old = now > 100 ? now - 100 : 1;
+    test_kv_stub_file(dir, cold_sha, KV_REASON_COLD, 512, 0, old, 2048);
     test_kv_stub_file(dir, continued_sha, KV_REASON_CONTINUED, 2048, 0, now, 2048);
 
     char cold_name[44], continued_name[44];
@@ -19901,18 +19825,16 @@ static void ds4_server_unit_tests_run(void) {
     test_kv_cache_lookup_uses_longest_text_prefix();
     test_kv_cache_lookup_rejects_wrong_model();
     test_kv_cache_lookup_rejects_stale_payload_abi();
-    test_kv_cache_eviction_values_fresh_snapshots();
-    test_kv_cache_eviction_prefers_anchor_reason();
+    test_kv_cache_eviction_uses_lru();
+    test_kv_cache_eviction_ignores_anchor_reason();
     test_kv_cache_eviction_reserves_requested_space();
     test_kv_cache_eviction_ignores_oversize_incoming();
     test_kv_cache_precommit_preserves_fallback_and_protected();
     test_kv_cache_precommit_does_not_prune_superseded();
     test_kv_cache_prunes_superseded_runtime_checkpoints();
     test_kv_cache_open_removes_only_abandoned_temps();
-    test_kv_cache_eviction_keeps_smaller_context_prefix();
-    test_kv_cache_eviction_score_decays_stale_hits();
-    test_kv_cache_eviction_decayed_hits_tie_break_by_age();
-    test_kv_cache_eviction_keeps_aligned_continued_frontiers();
+    test_kv_cache_eviction_ignores_hits();
+    test_kv_cache_eviction_keeps_recent_continued_frontier();
 }
 
 #ifndef DS4_SERVER_TEST_NO_MAIN
