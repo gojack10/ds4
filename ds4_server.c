@@ -696,6 +696,8 @@ typedef struct {
     bool responses_requires_live_reasoning;
     stop_list responses_live_call_ids;
     char *responses_live_suffix_text;
+    /* OpenAI Chat and Anthropic share this structured-message continuation
+     * state; the field names predate OpenAI Chat support. */
     bool anthropic_requires_live_tool_state;
     stop_list anthropic_live_call_ids;
     char *anthropic_live_suffix_text;
@@ -2941,10 +2943,12 @@ static void responses_prepare_live_continuation(request *r,
                                          &r->tool_orders, r->think_mode);
 }
 
-static bool anthropic_msg_is_tool_result_tail(const chat_msg *m) {
-    return m && !strcmp(m->role, "user") &&
-           ((m->tool_call_id && m->tool_call_id[0]) ||
-            m->tool_call_ids_len > 0);
+static bool message_is_tool_result_tail(const chat_msg *m, api_style api) {
+    if (!m || !((m->tool_call_id && m->tool_call_id[0]) ||
+                m->tool_call_ids_len > 0)) return false;
+    if (api == API_OPENAI)
+        return !strcmp(m->role, "tool") || !strcmp(m->role, "function");
+    return api == API_ANTHROPIC && !strcmp(m->role, "user");
 }
 
 /* Validate Anthropic tool results before rendering.
@@ -2976,7 +2980,7 @@ static bool anthropic_validate_tool_results(server *s, const chat_msgs *msgs,
             }
             continue;
         }
-        if (!anthropic_msg_is_tool_result_tail(m)) continue;
+        if (!message_is_tool_result_tail(m, API_ANTHROPIC)) continue;
 
         stop_list ids = {0};
         chat_msg_collect_tool_call_ids(m, &ids);
@@ -3003,22 +3007,22 @@ static bool anthropic_validate_tool_results(server *s, const chat_msgs *msgs,
     return ok;
 }
 
-/* Prepare the Anthropic live-tool fast path.
+/* Prepare the structured-message live-tool fast path.
  *
- * Anthropic's visible replay normally includes the assistant tool_use JSON and
- * the user tool_result.  That replay is still only a description of what the
- * model sampled.  If the incoming tool_result IDs match the live sampled
- * frontier, generate_job() can skip replay matching entirely and append just
- * EOS + tool_result + next assistant prefix to the real KV. */
-static void anthropic_prepare_live_continuation(request *r,
-                                                const chat_msgs *msgs) {
-    if (!r || r->api != API_ANTHROPIC || !msgs || msgs->len == 0) return;
+ * OpenAI Chat Completions and Anthropic Messages replay the assistant call plus
+ * tool result as structured JSON.  If the incoming result IDs match the live
+ * sampled frontier, generate_job() can skip replay matching and append only the
+ * tool-result tail plus the next assistant prefix. */
+static void message_prepare_live_continuation(request *r,
+                                              const chat_msgs *msgs) {
+    if (!r || (r->api != API_OPENAI && r->api != API_ANTHROPIC) ||
+        !msgs || msgs->len == 0) return;
 
     int tail_end = msgs->len;
     while (tail_end > 0 && role_is_system(msgs->v[tail_end - 1].role)) tail_end--;
     int tail_start = tail_end;
     while (tail_start > 0 &&
-           anthropic_msg_is_tool_result_tail(&msgs->v[tail_start - 1]))
+           message_is_tool_result_tail(&msgs->v[tail_start - 1], r->api))
     {
         tail_start--;
     }
@@ -3198,6 +3202,7 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
         think_mode_from_enabled(thinking_enabled, reasoning_effort), ctx_size);
     kv_cache_restore_tool_memory_for_messages(s, &msgs);
     tool_memory_attach_to_messages(s, &msgs, &r->tool_replay);
+    message_prepare_live_continuation(r, &msgs);
     const char *active_tool_schemas = r->has_tools ? tool_schemas : NULL;
     r->prompt_preserves_reasoning =
         chat_history_uses_tool_context(&msgs, active_tool_schemas);
@@ -3413,7 +3418,7 @@ static bool parse_anthropic_request(ds4_engine *e, server *s, const char *body, 
     }
     kv_cache_restore_tool_memory_for_messages(s, &msgs);
     tool_memory_attach_to_messages(s, &msgs, &r->tool_replay);
-    anthropic_prepare_live_continuation(r, &msgs);
+    message_prepare_live_continuation(r, &msgs);
     const char *active_tool_schemas = r->has_tools ? tool_schemas : NULL;
     r->prompt_preserves_reasoning =
         chat_history_uses_tool_context(&msgs, active_tool_schemas);
@@ -10517,19 +10522,19 @@ static int responses_live_continuation_prompt(server *s, server_slot *slot,
     return live_tokens->len;
 }
 
-/* Tool-result Anthropic continuation.
+/* Structured-message tool-result continuation.
  *
- * /v1/messages has no server-side response object like the OpenAI Responses
- * API, but its tool_use_id is still a precise continuation handle inside a live
- * local agent loop.  When the IDs and live token frontier match, continue from
- * the sampled DSML state and append only the user tool_result suffix. */
-static int anthropic_live_continuation_prompt(server *s, server_slot *slot,
-                                              const request *req,
-                                              int live_pos,
-                                              ds4_tokens *effective_prompt,
-                                              int *matched_ids) {
+ * OpenAI Chat Completions and Anthropic Messages both echo the prior tool-call
+ * ID with each result.  When those IDs and the live token frontier match,
+ * continue from the sampled tool-call state and append only the result suffix. */
+static int message_live_continuation_prompt(server *s, server_slot *slot,
+                                            const request *req,
+                                            int live_pos,
+                                            ds4_tokens *effective_prompt,
+                                            int *matched_ids) {
     if (!s || !slot || !req || !effective_prompt) return 0;
-    if (req->api != API_ANTHROPIC || !req->anthropic_live_suffix_text) return 0;
+    if ((req->api != API_OPENAI && req->api != API_ANTHROPIC) ||
+        !req->anthropic_live_suffix_text) return 0;
     if (req->anthropic_live_call_ids.len == 0) return 0;
     if (!anthropic_live_matches_request(s, slot,
                                         &req->anthropic_live_call_ids,
@@ -12210,11 +12215,11 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     const ds4_tokens *prompt_for_sync = &j->req.prompt;
     const bool responses_protocol = j->req.api == API_RESPONSES;
     bool responses_live_continuation = false;
-    bool anthropic_live_continuation = false;
+    bool message_live_continuation = false;
     bool thinking_live_continuation = false;
     const char *responses_live_match = NULL;
     int responses_live_match_ids = 0;
-    int anthropic_live_match_ids = 0;
+    int message_live_match_ids = 0;
     /* Responses gets the first chance to continue from live state.  This is
      * the whole point of the API shape: a request that is bound to prior live
      * output by visible transcript or tool call ids does not need to prove an
@@ -12244,12 +12249,13 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
         responses_live_continuation = true;
         prompt_for_sync = &effective_prompt;
     } else {
-        cached = anthropic_live_continuation_prompt(s, slot, &j->req, old_pos,
-                                                    &effective_prompt,
-                                                    &anthropic_live_match_ids);
+        cached = message_live_continuation_prompt(s, slot, &j->req, old_pos,
+                                                  &effective_prompt,
+                                                  &message_live_match_ids);
         if (cached > 0) {
-            anthropic_live_continuation = true;
-            cache_source = "anthropic-tool-output";
+            message_live_continuation = true;
+            cache_source = j->req.api == API_OPENAI
+                ? "openai-chat-tool-output" : "anthropic-tool-output";
             prompt_for_sync = &effective_prompt;
         }
     }
@@ -12394,10 +12400,11 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
                    responses_live_match_ids,
                    cached,
                    prompt_tokens);
-    } else if (anthropic_live_continuation) {
+    } else if (message_live_continuation) {
         server_log(DS4_LOG_PREFILL,
-                   "ds4-server: anthropic live continuation match=tool-output-ids ids=%d cached=%d prompt=%d",
-                   anthropic_live_match_ids,
+                   "ds4-server: %s live continuation match=tool-output-ids ids=%d cached=%d prompt=%d",
+                   j->req.api == API_OPENAI ? "openai-chat" : "anthropic",
+                   message_live_match_ids,
                    cached,
                    prompt_tokens);
     } else if (thinking_live_continuation) {
@@ -12532,7 +12539,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     /* Once a non-live request wins, old protocol live bindings are stale. Keep
      * a binding only when this request explicitly continued from it. */
     if (!responses_live_continuation) responses_live_clear(s, slot);
-    if (!anthropic_live_continuation) anthropic_live_clear(s, slot);
+    if (!message_live_continuation) anthropic_live_clear(s, slot);
     if (!thinking_live_continuation) thinking_live_clear(s, slot);
     ds4_session_set_progress(slot->session, NULL, NULL);
     ds4_session_set_display_progress(slot->session, NULL, NULL);
@@ -13338,7 +13345,8 @@ decode_again:
                 responses_live_clear(s, slot);
             }
         }
-        if (j->req.api == API_ANTHROPIC) {
+        if (j->req.kind == REQ_CHAT &&
+            (j->req.api == API_OPENAI || j->req.api == API_ANTHROPIC)) {
             if (parsed_calls.len && strcmp(final_finish, "error") &&
                 strcmp(final_finish, "length"))
                 anthropic_live_remember(s, slot, &parsed_calls);
@@ -17303,7 +17311,7 @@ static void test_anthropic_live_tail_renders_tool_results_only(void) {
     system.content = xstrdup("You are terse.");
     chat_msgs_push(&msgs, system);
 
-    anthropic_prepare_live_continuation(&r, &msgs);
+    message_prepare_live_continuation(&r, &msgs);
     TEST_ASSERT(r.anthropic_live_call_ids.len == 1);
     TEST_ASSERT(!strcmp(r.anthropic_live_call_ids.v[0], "toolu_live"));
     TEST_ASSERT(r.anthropic_live_suffix_text != NULL);
@@ -17313,6 +17321,44 @@ static void test_anthropic_live_tail_renders_tool_results_only(void) {
     TEST_ASSERT(strstr(r.anthropic_live_suffix_text, "/tmp</tool_result>") != NULL);
     TEST_ASSERT(strstr(r.anthropic_live_suffix_text, "<｜Assistant｜><think>") != NULL);
     TEST_ASSERT(strstr(r.anthropic_live_suffix_text, "Bash") == NULL);
+
+    chat_msgs_free(&msgs);
+    request_free(&r);
+}
+
+static void test_openai_chat_live_tail_renders_glm_tool_result_only(void) {
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_OPENAI;
+    r.model_syntax = SERVER_MODEL_SYNTAX_GLM;
+    r.think_mode = DS4_THINK_HIGH;
+
+    chat_msgs msgs = {0};
+    chat_msg assistant = {0};
+    assistant.role = xstrdup("assistant");
+    tool_call tc = {0};
+    tc.id = xstrdup("call_live");
+    tc.name = xstrdup("read");
+    tc.arguments = xstrdup("{\"path\":\"/tmp/a\"}");
+    tool_calls_push(&assistant.calls, tc);
+    chat_msgs_push(&msgs, assistant);
+
+    chat_msg tool = {0};
+    tool.role = xstrdup("tool");
+    tool.content = xstrdup("file contents");
+    chat_msg_add_tool_call_id(&tool, "call_live");
+    chat_msgs_push(&msgs, tool);
+
+    message_prepare_live_continuation(&r, &msgs);
+    TEST_ASSERT(r.anthropic_live_call_ids.len == 1);
+    TEST_ASSERT(!strcmp(r.anthropic_live_call_ids.v[0], "call_live"));
+    TEST_ASSERT(r.anthropic_live_suffix_text != NULL);
+    TEST_ASSERT(!strncmp(r.anthropic_live_suffix_text,
+                         "<|observation|><tool_response>",
+                         strlen("<|observation|><tool_response>")));
+    TEST_ASSERT(strstr(r.anthropic_live_suffix_text,
+                       "file contents</tool_response><|assistant|><think>") != NULL);
+    TEST_ASSERT(strstr(r.anthropic_live_suffix_text, "read") == NULL);
 
     chat_msgs_free(&msgs);
     request_free(&r);
@@ -19772,6 +19818,7 @@ static void ds4_server_unit_tests_run(void) {
     test_tool_memory_replays_sampled_dsml();
     test_anthropic_tool_memory_replays_sampled_dsml();
     test_anthropic_live_tail_renders_tool_results_only();
+    test_openai_chat_live_tail_renders_glm_tool_result_only();
     test_anthropic_tool_result_id_validation();
     test_anthropic_full_replay_allows_unknown_live_id();
     test_anthropic_tool_use_parses_before_role();
