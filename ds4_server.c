@@ -14464,15 +14464,23 @@ static bool send_model(server *s, int fd, const char *id) {
     return ok;
 }
 
+static const char *glm_advertised_model_id(bool glm53, size_t i) {
+    static const char *const ids[][3] = {
+        {"glm-5.2", "glm-5.2-chat", "glm-5.2-reasoner"},
+        {"glm-5.3-flash", "glm-5.3-flash-chat", "glm-5.3-flash-reasoner"},
+    };
+    return i < 3 ? ids[glm53][i] : NULL;
+}
+
 static bool send_models(server *s, int fd) {
     buf b = {0};
     buf_puts(&b, "{\"object\":\"list\",\"data\":[");
     if (ds4_engine_is_glm_dsa(s->engine)) {
-        append_model_json(&b, s, "glm-5.2");
-        buf_putc(&b, ',');
-        append_model_json(&b, s, "glm-5.2-chat");
-        buf_putc(&b, ',');
-        append_model_json(&b, s, "glm-5.2-reasoner");
+        for (size_t i = 0; i < 3; i++) {
+            if (i) buf_putc(&b, ',');
+            append_model_json(&b, s,
+                              glm_advertised_model_id(ds4_engine_is_glm53(s->engine), i));
+        }
     } else {
         append_model_json(&b, s, "deepseek-v4-flash");
         buf_putc(&b, ',');
