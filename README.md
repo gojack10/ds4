@@ -2,6 +2,8 @@
   <img src="logo.svg" alt="DwarfStar logo" width="220">
 </p>
 
+> **Fork branch:** production hardening for resident GLM 5.3 Flash on Apple M5 Max. See [FORK.md](FORK.md) for the patch stack, deployment profile, verification, and upstream contribution plan.
+
 **DwarfStar** is a small native inference engine optimized first for
 **DeepSeek V4 Flash**. It also supports **GLM 5.2 and 5.3**, **GLM 5.3 Flash**, and,
 on very high-memory machines, **DeepSeek V4 PRO**. It is self-contained and
