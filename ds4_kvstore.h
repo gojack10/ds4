@@ -89,6 +89,7 @@ typedef struct {
     const char *protected_sha;
     const char *fallback_sha;
     const char *committed_sha;
+    uint8_t committed_reason;
 } ds4_kvstore_eviction_context;
 
 typedef struct {
