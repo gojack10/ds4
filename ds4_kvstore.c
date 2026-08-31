@@ -525,6 +525,10 @@ static bool kv_cache_incoming_supersedes_runtime_checkpoint(
         const ds4_kvstore_entry *e,
         const ds4_kvstore_eviction_context *incoming) {
     if (!e || !incoming || !incoming->text) return false;
+    /* Only a prompt-prefill checkpoint is guaranteed to remain a reusable
+     * client-visible prefix. Displaced/shutdown live state may end in sampled
+     * private tool syntax, so it must not delete the preceding replay point. */
+    if (incoming->committed_reason != DS4_KVSTORE_REASON_CONTINUED) return false;
     if (e->reason != DS4_KVSTORE_REASON_CONTINUED &&
         e->reason != DS4_KVSTORE_REASON_SHUTDOWN)
     {
@@ -1235,6 +1239,7 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
             .reject_different_quant = kc->reject_different_quant,
             .protected_sha = protected_sha,
             .committed_sha = sha,
+            .committed_reason = reason_code,
         };
         ds4_kvstore_evict(kc, live_tokens, 0, &incoming);
     }

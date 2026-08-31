@@ -20064,6 +20064,53 @@ static void test_kv_cache_precommit_does_not_prune_superseded(void) {
     rmdir(dir);
 }
 
+static void test_kv_cache_displaced_live_keeps_replay_checkpoint(void) {
+    char tmpl[] = "/tmp/ds4-kv-replay-fallback-test.XXXXXX";
+    char *dir = mkdtemp(tmpl);
+    TEST_ASSERT(dir != NULL);
+    if (!dir) return;
+
+    const char *continued_text = "system: replayable prompt";
+    const char *evict_text = "system: replayable prompt<private-tool-xml>";
+    test_kv_text_stub_file(dir, continued_text, KV_REASON_CONTINUED, 4096, 2048);
+    test_kv_text_stub_file(dir, evict_text, KV_REASON_EVICT, 4352, 2048);
+
+    const char *texts[] = {continued_text, evict_text};
+    char shas[2][41], *paths[2];
+    for (int i = 0; i < 2; i++) {
+        char name[44];
+        sha1_bytes_hex(texts[i], strlen(texts[i]), shas[i]);
+        snprintf(name, sizeof(name), "%.40s.kv", shas[i]);
+        paths[i] = path_join(dir, name);
+    }
+
+    kv_disk_cache kc = {0};
+    kc.enabled = true;
+    kc.dir = xstrdup(dir);
+    kc.opt = kv_cache_default_options();
+    kc.budget_bytes = 1024u * 1024u;
+    ds4_kvstore_eviction_context incoming = {
+        .text = evict_text,
+        .text_len = strlen(evict_text),
+        .model_id = 0,
+        .quant_bits = 2,
+        .ctx_size = 32768,
+        .committed_sha = shas[1],
+        .committed_reason = KV_REASON_EVICT,
+    };
+    kv_cache_evict(&kc, NULL, 0, &incoming);
+
+    TEST_ASSERT(access(paths[0], F_OK) == 0);
+    TEST_ASSERT(access(paths[1], F_OK) == 0);
+
+    kv_cache_close(&kc);
+    for (int i = 0; i < 2; i++) {
+        unlink(paths[i]);
+        free(paths[i]);
+    }
+    rmdir(dir);
+}
+
 static void test_kv_cache_prunes_superseded_runtime_checkpoints(void) {
     char tmpl[] = "/tmp/ds4-kv-prefix-prune-test.XXXXXX";
     char *dir = mkdtemp(tmpl);
@@ -20101,6 +20148,7 @@ static void test_kv_cache_prunes_superseded_runtime_checkpoints(void) {
         .ctx_size = 32768,
         .reject_different_quant = false,
         .committed_sha = shas[3],
+        .committed_reason = KV_REASON_CONTINUED,
     };
     kv_cache_evict(&kc, NULL, 0, &incoming);
 
@@ -20757,6 +20805,7 @@ static void ds4_server_unit_tests_run(void) {
     test_kv_cache_eviction_ignores_oversize_incoming();
     test_kv_cache_precommit_preserves_fallback_and_protected();
     test_kv_cache_precommit_does_not_prune_superseded();
+    test_kv_cache_displaced_live_keeps_replay_checkpoint();
     test_kv_cache_prunes_superseded_runtime_checkpoints();
     test_kv_cache_open_removes_only_abandoned_temps();
     test_kv_cache_eviction_ignores_hits();
