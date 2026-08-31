@@ -19537,6 +19537,16 @@ static void test_kv_cache_continued_uses_aligned_frontiers(void) {
     kc.continued_last_store_tokens = 20480;
     TEST_ASSERT(kv_cache_continued_store_target(&kc, 29999) == 0);
     TEST_ASSERT(kv_cache_continued_store_target(&kc, 30000) == 30000);
+
+    /* A loaded prefix can be off the continued interval. Prefill chunks must
+     * still publish the next aligned frontier instead of missing every one. */
+    kc.opt.continued_interval_tokens = 4096;
+    kc.opt.boundary_align_tokens = 2048;
+    kc.continued_last_store_tokens = 10592;
+    TEST_ASSERT(kv_cache_continued_store_target(&kc, 12640) == 12288);
+    kc.continued_last_store_tokens = 12288;
+    TEST_ASSERT(kv_cache_continued_store_target(&kc, 14688) == 0);
+    TEST_ASSERT(kv_cache_continued_store_target(&kc, 16736) == 16384);
 }
 
 static void test_kv_cache_cold_store_suppresses_duplicate_continued_boundary(void) {
