@@ -6966,6 +6966,9 @@ static void test_glm53_advertised_model_ids(void) {
     TEST_ASSERT(!strcmp(glm_advertised_model_id(true, 1), "glm-5.3-flash-chat"));
     TEST_ASSERT(!strcmp(glm_advertised_model_id(true, 2), "glm-5.3-flash-reasoner"));
     TEST_ASSERT(glm_advertised_model_id(true, 3) == NULL);
+    TEST_ASSERT(!strcmp(admin_stats_model_id(true, true), "glm-5.3-flash"));
+    TEST_ASSERT(!strcmp(admin_stats_model_id(true, false), "glm-5.2"));
+    TEST_ASSERT(!strcmp(admin_stats_model_id(false, false), "deepseek-v4-flash"));
     TEST_ASSERT(server_model_alias_known("glm-5.2"));
     TEST_ASSERT(server_model_alias_known("glm-5.2-chat"));
     TEST_ASSERT(server_model_alias_known("glm-5.2-reasoner"));

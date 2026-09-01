@@ -14543,10 +14543,15 @@ static bool send_models(server *s, int fd) {
     return ok;
 }
 
+static const char *admin_stats_model_id(bool glm_dsa, bool glm53) {
+    return glm_dsa ? glm_advertised_model_id(glm53, 0) : "deepseek-v4-flash";
+}
+
 static void append_admin_stats_json(buf *b, server *s) {
     buf_puts(b, "{\"active_models\":{\"models\":[{\"id\":");
-    json_escape(b, s->engine && ds4_engine_is_glm_dsa(s->engine) ?
-                    "glm-5.2" : "deepseek-v4-flash");
+    json_escape(b, admin_stats_model_id(
+                    s->engine && ds4_engine_is_glm_dsa(s->engine),
+                    s->engine && ds4_engine_is_glm53(s->engine)));
     buf_puts(b, ",\"prefilling\":[");
     bool comma = false;
     for (int i = 0; i < s->slot_count; i++) {
