@@ -11915,6 +11915,16 @@ static int server_prefill_quantum(server *s) {
     return server_prefill_quantum_for(s, generation_active);
 }
 
+static int server_prefill_slice_target(server *s, server_slot *slot,
+                                       int done, int quantum, int prompt_len) {
+    int target = done + quantum;
+    if (target > prompt_len || target < done) target = prompt_len;
+    if (target <= 0) target = prompt_len;
+    const int continued = kv_cache_slot_continued_target(s, slot, target);
+    if (continued > done && continued < target) target = continued;
+    return target;
+}
+
 /* Synchronize one resident slot without monopolizing the model executor.  A
  * non-matching prompt is first rebuilt to one quantum; a matching checkpoint
  * advances from its current frontier. Absolute positions remain session-local,
@@ -11942,9 +11952,8 @@ static int server_session_sync_impl(server *s, server_slot *slot,
     while (!g_stop_requested && (recovery || !slot_job_cancelled(slot)) &&
            (!called || done < prompt->len)) {
         int quantum = server_prefill_quantum(s);
-        int target = done + quantum;
-        if (target > prompt->len || target < done) target = prompt->len;
-        if (target <= 0) target = prompt->len;
+        int target = server_prefill_slice_target(s, slot, done, quantum,
+                                                 prompt->len);
 
         ds4_tokens prefix = *prompt;
         prefix.len = target;
@@ -19551,8 +19560,6 @@ static void test_kv_cache_continued_uses_aligned_frontiers(void) {
     TEST_ASSERT(kv_cache_continued_store_target(&kc, 29999) == 0);
     TEST_ASSERT(kv_cache_continued_store_target(&kc, 30000) == 30000);
 
-    /* A loaded prefix can be off the continued interval. Prefill chunks must
-     * still publish the next aligned frontier instead of missing every one. */
     kc.opt.continued_interval_tokens = 4096;
     kc.opt.boundary_align_tokens = 2048;
     kc.continued_last_store_tokens = 10592;
@@ -19560,6 +19567,32 @@ static void test_kv_cache_continued_uses_aligned_frontiers(void) {
     kc.continued_last_store_tokens = 12288;
     TEST_ASSERT(kv_cache_continued_store_target(&kc, 14688) == 0);
     TEST_ASSERT(kv_cache_continued_store_target(&kc, 16736) == 16384);
+}
+
+static void test_off_grid_prefill_stops_on_publishable_frontiers(void) {
+    server s = {0};
+    server_slot slot = {.continued_last_store_tokens = 10592};
+    s.kv.enabled = true;
+    s.kv.opt = kv_cache_default_options();
+    s.kv.opt.continued_interval_tokens = 4096;
+    s.kv.opt.boundary_align_tokens = 2048;
+
+    int done = 10592;
+    int published[2] = {0};
+    int count = 0;
+    while (done < 18000) {
+        done = server_prefill_slice_target(&s, &slot, done, 2048, 18000);
+        const int target = kv_cache_slot_continued_target(&s, &slot, done);
+        if (target) {
+            TEST_ASSERT(target == done);
+            TEST_ASSERT(count < 2);
+            published[count++] = target;
+            kv_cache_slot_note_store(&slot, target);
+        }
+    }
+    TEST_ASSERT(count == 2);
+    TEST_ASSERT(published[0] == 12288);
+    TEST_ASSERT(published[1] == 16384);
 }
 
 static void test_kv_cache_cold_store_suppresses_duplicate_continued_boundary(void) {
@@ -20890,6 +20923,7 @@ static void ds4_server_unit_tests_run(void) {
     test_kv_cache_chat_anchor_uses_last_user_before_assistant();
     test_kv_cache_chat_anchor_ignores_multiturn_tail();
     test_kv_cache_continued_uses_aligned_frontiers();
+    test_off_grid_prefill_stops_on_publishable_frontiers();
     test_kv_cache_cold_store_suppresses_duplicate_continued_boundary();
     test_kv_cache_file_size_must_fit_budget();
     test_kv_cache_transient_reservation_caps_without_overflow();
