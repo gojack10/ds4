@@ -6961,7 +6961,18 @@ static void test_abort_kv_recovery_contract(void) {
     test_real_kv_eviction_protects_incoming_sha();
 }
 
+static void test_glm53_advertised_model_ids(void) {
+    TEST_ASSERT(!strcmp(glm_advertised_model_id(true, 0), "glm-5.3-flash"));
+    TEST_ASSERT(!strcmp(glm_advertised_model_id(true, 1), "glm-5.3-flash-chat"));
+    TEST_ASSERT(!strcmp(glm_advertised_model_id(true, 2), "glm-5.3-flash-reasoner"));
+    TEST_ASSERT(glm_advertised_model_id(true, 3) == NULL);
+    TEST_ASSERT(server_model_alias_known("glm-5.2"));
+    TEST_ASSERT(server_model_alias_known("glm-5.2-chat"));
+    TEST_ASSERT(server_model_alias_known("glm-5.2-reasoner"));
+}
+
 static void test_server_unit_group(void) {
+    test_glm53_advertised_model_ids();
     ds4_server_unit_tests_run();
 }
 
