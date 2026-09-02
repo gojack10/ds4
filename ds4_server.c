@@ -11264,19 +11264,26 @@ static int responses_live_visible_prefix_prompt(server *s, server_slot *slot,
     return live_tokens->len;
 }
 
-/* Tool-less thinking continuation.
+/* Visible chat continuation.
  *
  * Chat/completions and Anthropic do not have a previous_response_id object that
- * binds a later request to the last sampled turn.  Still, after a normal
- * tool-less thinking answer, the next prompt renderer intentionally omits that
- * hidden reasoning.  The live KV state is richer than the visible transcript.
+ * binds a later request to the last sampled turn.  A tool-less thinking answer
+ * omits hidden reasoning on replay, while a tool-enabled plain answer has no
+ * tool-call id to bind it.  In both cases, remember the exact canonical text
+ * that the next request must extend.
  *
- * Remembering the visible transcript as a key lets us keep the sampled hidden
- * KV when the next request clearly extends that same visible history.  This is
- * the same byte-prefix idea used by the disk cache: the client-visible text
- * selects the checkpoint, while the payload stays the exact sampled token
- * frontier.  If the visible key does not match, callers fall back to ordinary
- * token/text/disk matching. */
+ * The client-visible text selects the sampled checkpoint while the payload
+ * remains the exact sampled token frontier.  If the byte prefix does not match,
+ * callers fall back to ordinary token/text/disk matching. */
+static bool visible_live_matches_prompt(const visible_live_state *live,
+                                        int live_pos, const char *prompt,
+                                        size_t prompt_len) {
+    return live && live->valid && live->live_tokens == live_pos &&
+           live->visible_text && live->visible_len < prompt_len &&
+           byte_prefix_match(prompt, prompt_len, live->visible_text,
+                             live->visible_len);
+}
+
 static int thinking_live_visible_prefix_prompt(server *s, server_slot *slot,
                                                const request *req,
                                                int live_pos,
@@ -11287,13 +11294,8 @@ static int thinking_live_visible_prefix_prompt(server *s, server_slot *slot,
     const size_t prompt_len = strlen(req->prompt_text);
     size_t visible_len = 0;
     pthread_mutex_lock(&s->tool_mu);
-    bool ok = slot->thinking_live.valid &&
-              slot->thinking_live.live_tokens == live_pos &&
-              slot->thinking_live.visible_text &&
-              slot->thinking_live.visible_len < prompt_len &&
-              byte_prefix_match(req->prompt_text, prompt_len,
-                                slot->thinking_live.visible_text,
-                                slot->thinking_live.visible_len);
+    bool ok = visible_live_matches_prompt(&slot->thinking_live, live_pos,
+                                          req->prompt_text, prompt_len);
     if (ok) visible_len = slot->thinking_live.visible_len;
     pthread_mutex_unlock(&s->tool_mu);
     if (!ok) return 0;
@@ -12092,12 +12094,15 @@ static bool continue_after_invalid_dsml(server *s, server_slot *slot,
 
 static bool should_remember_thinking_checkpoint(const request *r,
                                                 const thinking_state *thinking,
-                                                const char *finish) {
-    if (!r || r->kind != REQ_CHAT || r->has_tools) return false;
+                                                const char *finish,
+                                                const tool_calls *calls) {
+    if (!r || r->kind != REQ_CHAT || (calls && calls->len)) return false;
+    if (thinking && thinking->inside) return false;
+    if (r->has_tools)
+        return r->api != API_RESPONSES && finish && !strcmp(finish, "stop");
     if (r->prompt_preserves_reasoning) return false;
     if (!ds4_think_mode_enabled(r->think_mode)) return false;
     if (finish && (!strcmp(finish, "error") || !strcmp(finish, "length"))) return false;
-    if (thinking && thinking->inside) return false;
     return true;
 }
 
@@ -12507,19 +12512,37 @@ static char *build_toolless_thinking_visible_text(const request *r,
     return buf_take(&visible);
 }
 
+static char *build_chat_checkpoint_visible_text(const request *r,
+                                                const char *content,
+                                                const char *reasoning) {
+    if (!r || !r->prompt_text) return NULL;
+    if (!r->has_tools)
+        return build_toolless_thinking_visible_text(r, content);
+
+    char *suffix = build_tool_checkpoint_suffix(r, content, reasoning, NULL);
+    buf visible = {0};
+    buf_puts(&visible, r->prompt_text);
+    buf_puts(&visible, suffix ? suffix : "");
+    free(suffix);
+    return buf_take(&visible);
+}
+
 static void remember_thinking_checkpoint(server *s, server_slot *slot,
                                          const job *j, const char *ctx,
-                                         uint64_t trace_id, const char *content) {
-    char *visible = build_toolless_thinking_visible_text(&j->req, content);
+                                         uint64_t trace_id, const char *content,
+                                         const char *reasoning) {
+    char *visible = build_chat_checkpoint_visible_text(&j->req, content,
+                                                       reasoning);
     if (!visible) return;
 
+    const char *kind = j->req.has_tools ? "tool-enabled plain-answer" : "thinking";
     thinking_live_remember(s, slot, visible);
     server_log(DS4_LOG_KVCACHE,
-               "ds4-server: thinking live checkpoint remembered ctx=%s live=%d visible=%zu",
-               ctx, ds4_session_pos(slot->session), strlen(visible));
+               "ds4-server: %s live checkpoint remembered ctx=%s live=%d visible=%zu",
+               kind, ctx, ds4_session_pos(slot->session), strlen(visible));
     trace_event(s, trace_id,
-                "thinking live checkpoint remembered: live=%d visible=%zu",
-                ds4_session_pos(slot->session), strlen(visible));
+                "%s live checkpoint remembered: live=%d visible=%zu",
+                kind, ds4_session_pos(slot->session), strlen(visible));
     free(visible);
 }
 
@@ -13018,7 +13041,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
                                                 &effective_prompt);
         if (thinking_cached > 0) {
             cached = thinking_cached;
-            cache_source = "thinking-visible";
+            cache_source = j->req.has_tools ? "chat-visible" : "thinking-visible";
             thinking_live_continuation = true;
             prompt_for_sync = &effective_prompt;
         }
@@ -13126,7 +13149,9 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
                    prompt_tokens);
     } else if (thinking_live_continuation) {
         server_log(DS4_LOG_PREFILL,
-                   "ds4-server: thinking live continuation match=visible-prefix cached=%d prompt=%d",
+                   "ds4-server: %s live continuation match=visible-prefix cached=%d prompt=%d",
+                   j->req.has_tools && j->req.api == API_OPENAI
+                       ? "openai-chat" : "thinking",
                    cached,
                    prompt_tokens);
     }
@@ -14100,9 +14125,11 @@ decode_again:
         } else if (parsed_calls.len) {
             thinking_live_clear(s, slot);
         } else if (should_remember_thinking_checkpoint(&j->req, &thinking,
-                                                       final_finish)) {
+                                                       final_finish,
+                                                       &parsed_calls)) {
             remember_thinking_checkpoint(s, slot, j, ctx_span, trace_id,
-                                         parsed_content ? parsed_content : "");
+                                         parsed_content ? parsed_content : "",
+                                         parsed_reasoning);
         } else {
             thinking_live_clear(s, slot);
         }
@@ -19386,21 +19413,24 @@ static void test_thinking_checkpoint_remember_gate(void) {
     r.think_mode = DS4_THINK_HIGH;
     thinking_state st = {.inside = true};
 
-    TEST_ASSERT(!should_remember_thinking_checkpoint(&r, &st, "length"));
-    TEST_ASSERT(!should_remember_thinking_checkpoint(&r, &st, "stop"));
+    TEST_ASSERT(!should_remember_thinking_checkpoint(&r, &st, "length", NULL));
+    TEST_ASSERT(!should_remember_thinking_checkpoint(&r, &st, "stop", NULL));
 
     st.inside = false;
-    TEST_ASSERT(!should_remember_thinking_checkpoint(&r, &st, "length"));
-    TEST_ASSERT(should_remember_thinking_checkpoint(&r, &st, "stop"));
+    TEST_ASSERT(!should_remember_thinking_checkpoint(&r, &st, "length", NULL));
+    TEST_ASSERT(should_remember_thinking_checkpoint(&r, &st, "stop", NULL));
 
     r.prompt_preserves_reasoning = true;
-    TEST_ASSERT(!should_remember_thinking_checkpoint(&r, &st, "stop"));
+    TEST_ASSERT(!should_remember_thinking_checkpoint(&r, &st, "stop", NULL));
     r.prompt_preserves_reasoning = false;
     r.has_tools = true;
-    TEST_ASSERT(!should_remember_thinking_checkpoint(&r, &st, "stop"));
+    TEST_ASSERT(!should_remember_thinking_checkpoint(&r, &st, "length", NULL));
+    TEST_ASSERT(should_remember_thinking_checkpoint(&r, &st, "stop", NULL));
+    tool_calls calls = {.len = 1};
+    TEST_ASSERT(!should_remember_thinking_checkpoint(&r, &st, "stop", &calls));
     r.has_tools = false;
     r.think_mode = DS4_THINK_NONE;
-    TEST_ASSERT(!should_remember_thinking_checkpoint(&r, &st, "stop"));
+    TEST_ASSERT(!should_remember_thinking_checkpoint(&r, &st, "stop", NULL));
 
     request_free(&r);
 }
@@ -20585,42 +20615,74 @@ static void test_thinking_canonical_multi_turn(void) {
 }
 
 static void test_thinking_canonical_with_tools_preserves_reasoning(void) {
-    /* When tools ARE present, reasoning is preserved in re-render.
-     * The toolless thinking live binding should NOT fire (has_tools gate),
-     * and the tool-call replay path handles it.  Verify the template
-     * preserves reasoning when tool_context is true. */
+    /* A tool-enabled plain answer has no call ids to bind its sampled state.
+     * Its exact next-render text, including published reasoning, is the key. */
     const char *tool_schemas = "{\"name\":\"bash\"}";
+    const char *reasoning = "No tool is needed";
+    const char *content = "The answer is 42.";
 
     chat_msgs msgs = {0};
     chat_msg u = {0};
     u.role = xstrdup("user");
-    u.content = xstrdup("run ls");
+    u.content = xstrdup("answer plainly");
     chat_msgs_push(&msgs, u);
 
-    char *prompt_text = render_chat_prompt_text(&msgs, tool_schemas, NULL, DS4_THINK_HIGH);
+    char *prompt_text = render_chat_prompt_text_for_syntax(
+        SERVER_MODEL_SYNTAX_GLM, &msgs, tool_schemas, NULL, DS4_THINK_HIGH);
     size_t pt_len = strlen(prompt_text);
     TEST_ASSERT(!memcmp(prompt_text + pt_len - 7, "<think>", 7));
 
-    /* With tools, next render KEEPS reasoning */
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.has_tools = true;
+    r.think_mode = DS4_THINK_HIGH;
+    r.model_syntax = SERVER_MODEL_SYNTAX_GLM;
+    r.prompt_text = xstrdup(prompt_text);
+    char *visible = build_chat_checkpoint_visible_text(&r, content, reasoning);
+
     chat_msgs history = {0};
-    chat_msg hu = {0}; hu.role = xstrdup("user"); hu.content = xstrdup("run ls");
+    chat_msg hu = {0}; hu.role = xstrdup("user"); hu.content = xstrdup("answer plainly");
     chat_msgs_push(&history, hu);
     chat_msg ha = {0}; ha.role = xstrdup("assistant");
-    ha.reasoning = xstrdup("I should run bash");
-    ha.content = xstrdup("Here you go");
+    ha.reasoning = xstrdup(reasoning);
+    ha.content = xstrdup(content);
     chat_msgs_push(&history, ha);
-    chat_msg hu2 = {0}; hu2.role = xstrdup("user"); hu2.content = xstrdup("thanks");
+    chat_msg hu2 = {0}; hu2.role = xstrdup("user"); hu2.content = xstrdup("double it");
     chat_msgs_push(&history, hu2);
 
-    char *future = render_chat_prompt_text(&history, tool_schemas, NULL, DS4_THINK_HIGH);
-    /* Reasoning IS preserved when tools present */
-    TEST_ASSERT(strstr(future, "I should run bash") != NULL);
-    TEST_ASSERT(strstr(future, "<think>I should run bash</think>") != NULL);
+    char *future = render_chat_prompt_text_for_syntax(
+        SERVER_MODEL_SYNTAX_GLM, &history, tool_schemas, NULL, DS4_THINK_HIGH);
+    TEST_ASSERT(strlen(future) > strlen(visible));
+    TEST_ASSERT(!memcmp(future, visible, strlen(visible)));
+    TEST_ASSERT(strstr(visible, "<think>No tool is needed</think>") != NULL);
 
     free(future);
+    free(visible);
+    request_free(&r);
     free(prompt_text);
     chat_msgs_free(&msgs);
     chat_msgs_free(&history);
+}
+
+static void test_tool_enabled_plain_answer_binding_is_exact(void) {
+    visible_live_state live = {
+        .valid = true,
+        .live_tokens = 321,
+        .visible_text = "prefix<think>reasoning</think>answer",
+        .visible_len = strlen("prefix<think>reasoning</think>answer"),
+    };
+    const char *next = "prefix<think>reasoning</think>answer<|user|>double it";
+    TEST_ASSERT(visible_live_matches_prompt(&live, 321, next, strlen(next)));
+    TEST_ASSERT(!visible_live_matches_prompt(&live, 320, next, strlen(next)));
+    TEST_ASSERT(!visible_live_matches_prompt(&live, 321,
+                                             live.visible_text,
+                                             live.visible_len));
+
+    char *edited = xstrdup(next);
+    edited[7] = 'X';
+    TEST_ASSERT(!visible_live_matches_prompt(&live, 321, edited,
+                                             strlen(edited)));
+    free(edited);
 }
 
 static void test_thinking_canonical_non_thinking_mode_noop(void) {
@@ -20875,6 +20937,7 @@ static void ds4_server_unit_tests_run(void) {
     test_thinking_canonical_empty_content();
     test_thinking_canonical_multi_turn();
     test_thinking_canonical_with_tools_preserves_reasoning();
+    test_tool_enabled_plain_answer_binding_is_exact();
     test_thinking_canonical_non_thinking_mode_noop();
     test_openai_inline_image_content();
     test_http_image_paths_and_urls_are_rejected();
