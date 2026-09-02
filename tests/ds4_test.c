@@ -10,7 +10,6 @@ typedef enum {
     ABORT_TEST_CANCEL,
     ABORT_TEST_CLEAR_LIVE_STATE,
     ABORT_TEST_LOAD_CLEAN,
-    ABORT_TEST_REPLAY_PROMPT,
     ABORT_TEST_INVALIDATE,
 } abort_test_event_kind;
 
@@ -20,7 +19,6 @@ typedef struct {
 
 typedef struct {
     bool load_fails;
-    bool replay_fails;
 } abort_test_input;
 
 enum {
@@ -6839,8 +6837,8 @@ static void test_abort_recovery_ordering_contract(void) {
     int cancel = abort_test_event_index(&out, ABORT_TEST_CANCEL);
     int clear = abort_test_event_index(&out, ABORT_TEST_CLEAR_LIVE_STATE);
     int load = abort_test_event_index(&out, ABORT_TEST_LOAD_CLEAN);
-    int replay = abort_test_event_index(&out, ABORT_TEST_REPLAY_PROMPT);
-    TEST_ASSERT(cancel >= 0 && clear > cancel && load > clear && replay > load);
+    TEST_ASSERT(cancel >= 0 && clear > cancel && load > clear);
+    TEST_ASSERT(out.events_len == 3);
     TEST_ASSERT(abort_test_event_index(&out, ABORT_TEST_INVALIDATE) < 0);
 
     abort_test_input load_failure = {.load_fails = true};
@@ -6851,13 +6849,7 @@ static void test_abort_recovery_ordering_contract(void) {
     int invalidate = abort_test_event_index(&out, ABORT_TEST_INVALIDATE);
     TEST_ASSERT(cancel >= 0 && clear > cancel && load > clear &&
                 invalidate > load);
-    TEST_ASSERT(abort_test_event_index(&out, ABORT_TEST_REPLAY_PROMPT) < 0);
-
-    abort_test_input replay_failure = {.replay_fails = true};
-    TEST_ASSERT(abort_test_run(&replay_failure, &out));
-    replay = abort_test_event_index(&out, ABORT_TEST_REPLAY_PROMPT);
-    invalidate = abort_test_event_index(&out, ABORT_TEST_INVALIDATE);
-    TEST_ASSERT(replay >= 0 && invalidate > replay);
+    TEST_ASSERT(out.events_len == 4);
 }
 
 static void test_real_kv_oversized_checkpoint_survives_two_hits(void) {

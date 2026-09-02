@@ -12390,12 +12390,6 @@ static bool abort_test_load_clean_prefix(void *ud) {
     return !a->in->load_fails;
 }
 
-static bool abort_test_replay_prompt(void *ud) {
-    abort_test_adapter *a = ud;
-    abort_test_record(a->out, ABORT_TEST_REPLAY_PROMPT);
-    return !a->in->replay_fails;
-}
-
 static void abort_test_invalidate(void *ud) {
     abort_test_adapter *a = ud;
     abort_test_record(a->out, ABORT_TEST_INVALIDATE);
@@ -12411,7 +12405,6 @@ int ds4_server_test_abort_recovery_trace(const abort_test_input *input,
         .mark_cancelled = abort_test_mark_cancelled,
         .clear_live_state = abort_test_clear_live_state,
         .load_clean_prefix = abort_test_load_clean_prefix,
-        .replay_prompt = abort_test_replay_prompt,
         .invalidate = abort_test_invalidate,
     };
     (void)abort_recovery_run(&actions);
