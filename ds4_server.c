@@ -9439,6 +9439,7 @@ typedef struct {
     int generated_tokens;
     double tok_s;
     double eta;
+    bool stopping;
 } server_activity;
 
 struct server_slot {
@@ -9552,12 +9553,14 @@ static void server_activity_set_prefill(server_slot *slot, int processed,
                                         int total, double tok_s, double eta) {
     if (!slot) return;
     pthread_mutex_lock(&slot->activity_mu);
+    bool stopping = slot->activity.stopping;
     slot->activity = (server_activity){
         .phase = SERVER_ACTIVITY_PREFILL,
         .processed = processed,
         .total = total,
         .tok_s = tok_s,
         .eta = eta,
+        .stopping = stopping,
     };
     pthread_mutex_unlock(&slot->activity_mu);
 }
@@ -9566,11 +9569,20 @@ static void server_activity_set_decode(server_slot *slot, int generated_tokens,
                                        double tok_s) {
     if (!slot) return;
     pthread_mutex_lock(&slot->activity_mu);
+    bool stopping = slot->activity.stopping;
     slot->activity = (server_activity){
         .phase = SERVER_ACTIVITY_DECODE,
         .generated_tokens = generated_tokens,
         .tok_s = tok_s,
+        .stopping = stopping,
     };
+    pthread_mutex_unlock(&slot->activity_mu);
+}
+
+static void server_activity_mark_stopping(server_slot *slot) {
+    if (!slot) return;
+    pthread_mutex_lock(&slot->activity_mu);
+    slot->activity.stopping = true;
     pthread_mutex_unlock(&slot->activity_mu);
 }
 
@@ -12266,6 +12278,7 @@ typedef struct {
 static void server_abort_mark_cancelled(void *ud) {
     server_abort_recovery *r = ud;
     job_mark_cancelled(r->j);
+    server_activity_mark_stopping(r->slot);
 }
 
 static void server_abort_clear_live_state(void *ud) {
@@ -14533,8 +14546,10 @@ static void append_admin_stats_json(buf *b, server *s) {
         if (a.phase != SERVER_ACTIVITY_PREFILL) continue;
         if (comma) buf_putc(b, ',');
         buf_printf(b,
-                   "{\"processed\":%d,\"total\":%d,\"speed\":%.6f,\"eta\":%.6f}",
+                   "{\"processed\":%d,\"total\":%d,\"speed\":%.6f,\"eta\":%.6f",
                    a.processed, a.total, a.tok_s, a.eta);
+        if (a.stopping) buf_puts(b, ",\"stopping\":true");
+        buf_putc(b, '}');
         comma = true;
     }
     buf_puts(b, "],\"generating\":[");
@@ -14547,8 +14562,10 @@ static void append_admin_stats_json(buf *b, server *s) {
         if (a.phase != SERVER_ACTIVITY_DECODE) continue;
         if (comma) buf_putc(b, ',');
         buf_printf(b,
-                   "{\"generated_tokens\":%d,\"tokens_per_second\":%.6f,\"elapsed_seconds\":1.0}",
+                   "{\"generated_tokens\":%d,\"tokens_per_second\":%.6f,\"elapsed_seconds\":1.0",
                    a.generated_tokens, a.tok_s);
+        if (a.stopping) buf_puts(b, ",\"stopping\":true");
+        buf_putc(b, '}');
         comma = true;
     }
     pthread_mutex_lock(&s->usage_mu);
@@ -14650,6 +14667,7 @@ static void server_cancel_job(server *s, job *j) {
     for (int i = 0; i < s->slot_count; i++) {
         server_slot *slot = &s->slots[i];
         if (slot->running == j) {
+            server_activity_mark_stopping(slot);
             (void)server_cancel_pending_decode_locked(s, slot);
             break;
         }
@@ -20752,6 +20770,8 @@ static void test_admin_stats_reports_each_active_slot(void) {
     for (int i = 0; i < 2; i++) pthread_mutex_init(&slots[i].activity_mu, NULL);
 
     server_activity_set_prefill(&slots[0], 4096, 8192, 200.0, 20.48);
+    server_activity_mark_stopping(&slots[0]);
+    server_activity_set_prefill(&slots[0], 4096, 8192, 200.0, 20.48);
     server_activity_set_decode(&slots[1], 12, 9.5);
     buf b = {0};
     append_admin_stats_json(&b, &s);
@@ -20760,6 +20780,9 @@ static void test_admin_stats_reports_each_active_slot(void) {
     TEST_ASSERT(strstr(b.ptr, "\"total\":8192") != NULL);
     TEST_ASSERT(strstr(b.ptr, "\"generated_tokens\":12") != NULL);
     TEST_ASSERT(strstr(b.ptr, "\"tokens_per_second\":9.500000") != NULL);
+    char *stopping = strstr(b.ptr, "\"stopping\":true");
+    TEST_ASSERT(stopping != NULL);
+    TEST_ASSERT(stopping && strstr(stopping + 1, "\"stopping\":true") == NULL);
     buf_free(&b);
 
     for (int i = 0; i < 2; i++) pthread_mutex_destroy(&slots[i].activity_mu);
