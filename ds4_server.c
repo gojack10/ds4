@@ -20251,24 +20251,22 @@ static void test_kv_cache_displaced_live_keeps_replay_checkpoint(void) {
     rmdir(dir);
 }
 
-static void test_kv_cache_prunes_superseded_runtime_checkpoints(void) {
-    char tmpl[] = "/tmp/ds4-kv-prefix-prune-test.XXXXXX";
+static void test_kv_cache_rolls_two_runtime_checkpoints(void) {
+    char tmpl[] = "/tmp/ds4-kv-prefix-window-test.XXXXXX";
     char *dir = mkdtemp(tmpl);
     TEST_ASSERT(dir != NULL);
     if (!dir) return;
 
-    const char *cold_text = "system:";
-    const char *continued_text = "system: hello";
-    const char *shutdown_text = "system: hello world";
-    const char *committed_text = "system: hello world\nuser: prompt";
-    test_kv_text_stub_file(dir, cold_text, KV_REASON_COLD, 1024, 2048);
-    test_kv_text_stub_file(dir, continued_text, KV_REASON_CONTINUED, 2048, 2048);
-    test_kv_text_stub_file(dir, shutdown_text, KV_REASON_SHUTDOWN, 4096, 2048);
-    test_kv_text_stub_file(dir, committed_text, KV_REASON_CONTINUED, 8192, 2048);
-
-    const char *texts[] = {cold_text, continued_text, shutdown_text, committed_text};
-    char shas[4][41], *paths[4];
-    for (int i = 0; i < 4; i++) {
+    const char *texts[] = {
+        "system: hello",
+        "system: hello world",
+        "system: hello world\nuser: prompt",
+    };
+    const uint8_t reasons[] = {
+        KV_REASON_SHUTDOWN, KV_REASON_CONTINUED, KV_REASON_CONTINUED,
+    };
+    char shas[3][41], *paths[3];
+    for (int i = 0; i < 3; i++) {
         char name[44];
         sha1_bytes_hex(texts[i], strlen(texts[i]), shas[i]);
         snprintf(name, sizeof(name), "%.40s.kv", shas[i]);
@@ -20280,25 +20278,36 @@ static void test_kv_cache_prunes_superseded_runtime_checkpoints(void) {
     kc.dir = xstrdup(dir);
     kc.opt = kv_cache_default_options();
     kc.budget_bytes = 1024u * 1024u;
+
+    test_kv_text_stub_file(dir, texts[0], reasons[0], 2048, 2048);
+    test_kv_text_stub_file(dir, texts[1], reasons[1], 4096, 2048);
     ds4_kvstore_eviction_context incoming = {
-        .text = committed_text,
-        .text_len = strlen(committed_text),
-        .model_id = 0,
-        .quant_bits = 2,
-        .ctx_size = 32768,
-        .reject_different_quant = false,
-        .committed_sha = shas[3],
+        .text = texts[1], .text_len = strlen(texts[1]),
+        .model_id = 0, .quant_bits = 2, .ctx_size = 32768,
+        .committed_sha = shas[1],
         .committed_reason = KV_REASON_CONTINUED,
     };
     kv_cache_evict(&kc, NULL, 0, &incoming);
-
     TEST_ASSERT(access(paths[0], F_OK) == 0);
-    TEST_ASSERT(access(paths[1], F_OK) != 0);
-    TEST_ASSERT(access(paths[2], F_OK) != 0);
-    TEST_ASSERT(access(paths[3], F_OK) == 0);
+    TEST_ASSERT(access(paths[1], F_OK) == 0);
+
+    test_kv_text_stub_file(dir, texts[2], reasons[2], 8192, 2048);
+    incoming.text = texts[2];
+    incoming.text_len = strlen(texts[2]);
+    incoming.committed_sha = shas[2];
+    kv_cache_evict(&kc, NULL, 0, &incoming);
+    TEST_ASSERT(access(paths[0], F_OK) != 0);
+    TEST_ASSERT(access(paths[1], F_OK) == 0);
+    TEST_ASSERT(access(paths[2], F_OK) == 0);
+
+    kc.budget_bytes = KV_CACHE_FIXED_HEADER + 4u +
+                      strlen(texts[2]) + 2048u;
+    kv_cache_evict(&kc, NULL, 0, NULL);
+    TEST_ASSERT((access(paths[1], F_OK) == 0) !=
+                (access(paths[2], F_OK) == 0));
 
     kv_cache_close(&kc);
-    for (int i = 0; i < 4; i++) {
+    for (int i = 0; i < 3; i++) {
         unlink(paths[i]);
         free(paths[i]);
     }
@@ -20986,7 +20995,7 @@ static void ds4_server_unit_tests_run(void) {
     test_kv_cache_precommit_preserves_fallback_and_protected();
     test_kv_cache_precommit_does_not_prune_superseded();
     test_kv_cache_displaced_live_keeps_replay_checkpoint();
-    test_kv_cache_prunes_superseded_runtime_checkpoints();
+    test_kv_cache_rolls_two_runtime_checkpoints();
     test_kv_cache_open_removes_only_abandoned_temps();
     test_kv_cache_eviction_ignores_hits();
     test_kv_cache_eviction_keeps_recent_continued_frontier();

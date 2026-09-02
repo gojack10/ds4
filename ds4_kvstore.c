@@ -573,9 +573,17 @@ void ds4_kvstore_evict(ds4_kvstore *kc, const ds4_tokens *live,
     uint64_t total = 0;
     for (int i = 0; i < kc->len; i++) total += kc->entry[i].file_size;
     if (incoming && incoming->committed_sha) {
+        /* Keep the newest predecessor; budget LRU may still evict it below. */
+        int previous = -1;
+        for (int i = 0; i < kc->len; i++) {
+            ds4_kvstore_entry *e = &kc->entry[i];
+            if (kv_cache_incoming_supersedes_runtime_checkpoint(e, incoming) &&
+                (previous < 0 || e->text_bytes > kc->entry[previous].text_bytes))
+                previous = i;
+        }
         for (int i = 0; i < kc->len;) {
             ds4_kvstore_entry *e = &kc->entry[i];
-            if (kv_cache_entry_is_protected(e, incoming) ||
+            if (i == previous || kv_cache_entry_is_protected(e, incoming) ||
                 !kv_cache_incoming_supersedes_runtime_checkpoint(e, incoming))
             {
                 i++;
@@ -594,6 +602,7 @@ void ds4_kvstore_evict(ds4_kvstore *kc, const ds4_tokens *live,
             memmove(kc->entry + i, kc->entry + i + 1,
                     (size_t)(kc->len - i - 1) * sizeof(kc->entry[0]));
             kc->len--;
+            if (previous > i) previous--;
         }
     }
     const uint64_t target = kc->budget_bytes - extra_bytes;

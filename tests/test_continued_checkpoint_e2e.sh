@@ -5,7 +5,7 @@ checkpoint=${1:?usage: $0 10592-token-checkpoint.kv}
 url=${DS4_E2E_URL:-http://127.0.0.1:8002}
 log=${DS4_E2E_LOG:-/Users/jack/.dsv4/dsv4.log}
 kv_dir=${DS4_E2E_KV_DIR:-/Users/jack/.dsv4/kv}
-append_tokens=${DS4_E2E_APPEND_TOKENS:-7000}
+append_tokens=${DS4_E2E_APPEND_TOKENS:-12000}
 expected_sha=9410c9303ecb1ee98be3dec1f594124c0d520359
 
 read_uint() {
@@ -80,37 +80,49 @@ run_pass() {
     slice_tokens=$(printf '%s\n' "$slice" | sed 's|.* prefill chunk \([0-9][0-9]*\)/.*|\1|')
     [ "$((10592 + slice_tokens))" = 12288 ] || { echo "pass $pass: first slice did not end at 12288" >&2; exit 1; }
 
-    for tokens in 12288 16384; do
+    for tokens in 12288 16384 20480; do
         count=$(grep -c "kv cache stored tokens=$tokens .*reason=continued " "$run_log" || true)
         [ "$count" = 1 ] || { echo "pass $pass: expected one continued $tokens store, got $count" >&2; exit 1; }
     done
     store_12288_line=$(grep -n 'kv cache stored tokens=12288 .*reason=continued ' "$run_log" | cut -d: -f1)
     store_16384_line=$(grep -n 'kv cache stored tokens=16384 .*reason=continued ' "$run_log" | cut -d: -f1)
+    store_20480_line=$(grep -n 'kv cache stored tokens=20480 .*reason=continued ' "$run_log" | cut -d: -f1)
+    superseded_12288_line=$(grep -n 'kv cache evicted reason=superseded tokens=12288 ' "$run_log" | cut -d: -f1)
 
     finish=$(grep -nF "chat ctx=$ctx gen=" "$run_log" | grep ' finish=' || true)
     [ "$(printf '%s\n' "$finish" | grep -c . || true)" = 1 ] || { echo "pass $pass: expected exactly one measured finish" >&2; exit 1; }
     finish_line=${finish%%:*}
     [ "$hit_line" -lt "$start_line" ] && [ "$start_line" -lt "$slice_line" ] && \
         [ "$slice_line" -lt "$store_12288_line" ] && [ "$store_12288_line" -lt "$store_16384_line" ] && \
-        [ "$store_16384_line" -lt "$finish_line" ] || { echo "pass $pass: required log events out of order" >&2; exit 1; }
+        [ "$store_16384_line" -lt "$store_20480_line" ] && \
+        [ "$store_20480_line" -lt "$superseded_12288_line" ] && \
+        [ "$superseded_12288_line" -lt "$finish_line" ] || { echo "pass $pass: required log events out of order" >&2; exit 1; }
+    if grep -q 'kv cache evicted reason=superseded tokens=16384 ' "$run_log"; then
+        echo "pass $pass: retained 16384 checkpoint was superseded too early" >&2
+        exit 1
+    fi
 
     if grep -q 'reason=continued because live checkpoint is at' "$run_log"; then
         echo "pass $pass: continued checkpoint publication was skipped" >&2
         exit 1
     fi
 
-    found=false
-    for file in "$kv_dir"/*.kv; do
-        [ -e "$file" ] || continue
-        [ "$(read_uint "$file" 8 4)" = 16384 ] || continue
-        [ "$(read_uint "$file" 5 1)" = 2 ] || continue
-        [ "$(read_uint "$file" 7 1)" = 3 ] || continue
-        [ "$(read_uint "$file" 24 8)" -ge "$started_at" ] || continue
-        found=true
-        break
+    for tokens in 12288 16384 20480; do
+        found=0
+        for file in "$kv_dir"/*.kv; do
+            [ -e "$file" ] || continue
+            [ "$(read_uint "$file" 8 4)" = "$tokens" ] || continue
+            [ "$(read_uint "$file" 5 1)" = 2 ] || continue
+            [ "$(read_uint "$file" 7 1)" = 3 ] || continue
+            [ "$(read_uint "$file" 24 8)" -ge "$started_at" ] || continue
+            found=$((found + 1))
+        done
+        case "$tokens:$found" in
+            12288:0|16384:1|20480:1) ;;
+            *) echo "pass $pass: rolling-window disk count tokens=$tokens expected 0/1/1, got $found" >&2; exit 1 ;;
+        esac
     done
-    "$found" || { echo "pass $pass: new continued 16384 checkpoint missing" >&2; exit 1; }
-    printf 'pass %s: 10592 -> 12288 -> 16384 continued checkpoints verified\n' "$pass"
+    printf 'pass %s: 10592 -> 12288 -> 16384 -> 20480 rolling window verified\n' "$pass"
 }
 
 run_pass 1
