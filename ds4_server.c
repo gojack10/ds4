@@ -787,6 +787,8 @@ typedef struct {
     stop_list stops;
     char *raw_body;
     char *prompt_text;
+    char request_id[128];
+    char origin[64];
     tool_schema_orders tool_orders;
     int max_tokens;
     int top_k;
@@ -9440,6 +9442,8 @@ typedef struct {
     double tok_s;
     double eta;
     bool stopping;
+    char request_id[128];
+    char origin[64];
 } server_activity;
 
 struct server_slot {
@@ -9549,19 +9553,34 @@ static void server_activity_clear(server_slot *slot) {
     pthread_mutex_unlock(&slot->activity_mu);
 }
 
+static void server_activity_set_provenance(server_slot *slot,
+                                           const char *request_id,
+                                           const char *origin) {
+    if (!slot) return;
+    pthread_mutex_lock(&slot->activity_mu);
+    snprintf(slot->activity.request_id, sizeof(slot->activity.request_id),
+             "%s", request_id ? request_id : "");
+    snprintf(slot->activity.origin, sizeof(slot->activity.origin),
+             "%s", origin ? origin : "");
+    pthread_mutex_unlock(&slot->activity_mu);
+}
+
 static void server_activity_set_prefill(server_slot *slot, int processed,
                                         int total, double tok_s, double eta) {
     if (!slot) return;
     pthread_mutex_lock(&slot->activity_mu);
-    bool stopping = slot->activity.stopping;
-    slot->activity = (server_activity){
+    server_activity next = {
         .phase = SERVER_ACTIVITY_PREFILL,
         .processed = processed,
         .total = total,
         .tok_s = tok_s,
         .eta = eta,
-        .stopping = stopping,
+        .stopping = slot->activity.stopping,
     };
+    snprintf(next.request_id, sizeof(next.request_id), "%s",
+             slot->activity.request_id);
+    snprintf(next.origin, sizeof(next.origin), "%s", slot->activity.origin);
+    slot->activity = next;
     pthread_mutex_unlock(&slot->activity_mu);
 }
 
@@ -9569,13 +9588,16 @@ static void server_activity_set_decode(server_slot *slot, int generated_tokens,
                                        double tok_s) {
     if (!slot) return;
     pthread_mutex_lock(&slot->activity_mu);
-    bool stopping = slot->activity.stopping;
-    slot->activity = (server_activity){
+    server_activity next = {
         .phase = SERVER_ACTIVITY_DECODE,
         .generated_tokens = generated_tokens,
         .tok_s = tok_s,
-        .stopping = stopping,
+        .stopping = slot->activity.stopping,
     };
+    snprintf(next.request_id, sizeof(next.request_id), "%s",
+             slot->activity.request_id);
+    snprintf(next.origin, sizeof(next.origin), "%s", slot->activity.origin);
+    slot->activity = next;
     pthread_mutex_unlock(&slot->activity_mu);
 }
 
@@ -14210,6 +14232,7 @@ decode_again:
  * return in the large protocol/generation path. The callback is cleared before
  * the client thread can destroy its stack-owned job. */
 static void generate_job(server *s, server_slot *slot, job *j) {
+    server_activity_set_provenance(slot, j->req.request_id, j->req.origin);
     pthread_mutex_lock(&s->model_mu);
     slot->running = j;
     pthread_mutex_unlock(&s->model_mu);
@@ -14383,6 +14406,8 @@ static void *slot_worker_main(void *arg) {
 typedef struct {
     char method[8];
     char path[256];
+    char request_id[128];
+    char origin[64];
     char *body;
     size_t body_len;
 } http_request;
@@ -14400,6 +14425,33 @@ static ssize_t header_end(const char *p, size_t n) {
         if (p[i - 1] == '\n' && p[i] == '\n') return (ssize_t)(i + 1);
     }
     return -1;
+}
+
+static void http_header_value(const char *h, size_t n, const char *name,
+                              char *out, size_t outlen) {
+    const char *p = h, *end = h + n;
+    size_t name_len = strlen(name);
+    if (!outlen) return;
+    out[0] = '\0';
+    while (p < end) {
+        const char *line = p;
+        while (p < end && *p != '\n') p++;
+        size_t len = (size_t)(p - line);
+        if (len && line[len - 1] == '\r') len--;
+        if (len > name_len && line[name_len] == ':' &&
+            strncasecmp(line, name, name_len) == 0) {
+            const char *v = line + name_len + 1;
+            const char *vend = line + len;
+            while (v < vend && isspace((unsigned char)*v)) v++;
+            while (vend > v && isspace((unsigned char)vend[-1])) vend--;
+            size_t copy = (size_t)(vend - v);
+            if (copy >= outlen) copy = outlen - 1;
+            memcpy(out, v, copy);
+            out[copy] = '\0';
+            return;
+        }
+        if (p < end) p++;
+    }
 }
 
 static long content_length(const char *h, size_t n) {
@@ -14446,6 +14498,10 @@ static bool read_http_request(int fd, http_request *r) {
     char *q = strchr(r->path, '?');
     if (q) *q = '\0';
 
+    http_header_value(b.ptr, (size_t)hend, "X-Pi-Request-Id",
+                      r->request_id, sizeof(r->request_id));
+    http_header_value(b.ptr, (size_t)hend, "X-Pi-Origin",
+                      r->origin, sizeof(r->origin));
     long clen = content_length(b.ptr, (size_t)hend);
     if (clen < 0 || (size_t)clen > max_body) goto fail;
     while (b.len < (size_t)hend + (size_t)clen) {
@@ -14558,6 +14614,17 @@ static const char *admin_stats_model_id(bool glm_dsa, bool glm53) {
     return glm_dsa ? glm_advertised_model_id(glm53, 0) : "deepseek-v4-flash";
 }
 
+static void append_activity_provenance(buf *b, const server_activity *a) {
+    if (a->request_id[0]) {
+        buf_puts(b, ",\"request_id\":");
+        json_escape(b, a->request_id);
+    }
+    if (a->origin[0]) {
+        buf_puts(b, ",\"origin\":");
+        json_escape(b, a->origin);
+    }
+}
+
 static void append_admin_stats_json(buf *b, server *s) {
     buf_puts(b, "{\"active_models\":{\"models\":[{\"id\":");
     json_escape(b, admin_stats_model_id(
@@ -14576,6 +14643,7 @@ static void append_admin_stats_json(buf *b, server *s) {
                    "{\"processed\":%d,\"total\":%d,\"speed\":%.6f,\"eta\":%.6f",
                    a.processed, a.total, a.tok_s, a.eta);
         if (a.stopping) buf_puts(b, ",\"stopping\":true");
+        append_activity_provenance(b, &a);
         buf_putc(b, '}');
         comma = true;
     }
@@ -14592,6 +14660,7 @@ static void append_admin_stats_json(buf *b, server *s) {
                    "{\"generated_tokens\":%d,\"tokens_per_second\":%.6f,\"elapsed_seconds\":1.0",
                    a.generated_tokens, a.tok_s);
         if (a.stopping) buf_puts(b, ",\"stopping\":true");
+        append_activity_provenance(b, &a);
         buf_putc(b, '}');
         comma = true;
     }
@@ -14771,6 +14840,10 @@ static void *client_main(void *arg) {
     } else if (!strcmp(hr.method, "POST") && !strcmp(hr.path, "/v1/chat/completions")) {
         ok = parse_chat_request(s->engine, s, hr.body, s->default_tokens,
                                 ctx_size, &req, err, sizeof(err));
+        if (ok) {
+            snprintf(req.request_id, sizeof(req.request_id), "%s", hr.request_id);
+            snprintf(req.origin, sizeof(req.origin), "%s", hr.origin);
+        }
     } else if (!strcmp(hr.method, "POST") && !strcmp(hr.path, "/v1/responses")) {
         ok = parse_responses_request(s->engine, s, hr.body, s->default_tokens,
                                      ctx_size, &req, err, sizeof(err));
@@ -20840,9 +20913,11 @@ static void test_admin_stats_reports_each_active_slot(void) {
     s.slot_count = 2;
     for (int i = 0; i < 2; i++) pthread_mutex_init(&slots[i].activity_mu, NULL);
 
+    server_activity_set_provenance(&slots[0], "req-user", "user");
     server_activity_set_prefill(&slots[0], 4096, 8192, 200.0, 20.48);
     server_activity_mark_stopping(&slots[0]);
     server_activity_set_prefill(&slots[0], 4096, 8192, 200.0, 20.48);
+    server_activity_set_provenance(&slots[1], "req-rewriter", "vega-rewriter");
     server_activity_set_decode(&slots[1], 12, 9.5);
     buf b = {0};
     append_admin_stats_json(&b, &s);
@@ -20851,6 +20926,8 @@ static void test_admin_stats_reports_each_active_slot(void) {
     TEST_ASSERT(strstr(b.ptr, "\"total\":8192") != NULL);
     TEST_ASSERT(strstr(b.ptr, "\"generated_tokens\":12") != NULL);
     TEST_ASSERT(strstr(b.ptr, "\"tokens_per_second\":9.500000") != NULL);
+    TEST_ASSERT(strstr(b.ptr, "\"request_id\":\"req-user\",\"origin\":\"user\"") != NULL);
+    TEST_ASSERT(strstr(b.ptr, "\"request_id\":\"req-rewriter\",\"origin\":\"vega-rewriter\"") != NULL);
     char *stopping = strstr(b.ptr, "\"stopping\":true");
     TEST_ASSERT(stopping != NULL);
     TEST_ASSERT(stopping && strstr(stopping + 1, "\"stopping\":true") == NULL);
