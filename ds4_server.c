@@ -11980,16 +11980,6 @@ static int server_session_sync(server *s, server_slot *slot,
     return server_session_sync_impl(s, slot, prompt, err, errlen, false);
 }
 
-static int server_session_sync_recovery(server *s, server_slot *slot,
-                                        const ds4_tokens *prompt,
-                                        char *err, size_t errlen) {
-    job *running = slot ? slot->running : NULL;
-    ds4_session_set_cancel(slot->session, NULL, NULL);
-    int rc = server_session_sync_impl(s, slot, prompt, err, errlen, true);
-    if (running) ds4_session_set_cancel(slot->session, job_cancelled, running);
-    return rc;
-}
-
 static int server_session_sync_multimodal(server *s, server_slot *slot,
                                           const ds4_tokens *prompt,
                                           const ds4_vision_span *images,
@@ -12242,20 +12232,19 @@ typedef struct {
     void (*mark_cancelled)(void *ud);
     void (*clear_live_state)(void *ud);
     bool (*load_clean_prefix)(void *ud);
-    bool (*replay_prompt)(void *ud);
     void (*invalidate)(void *ud);
 } abort_recovery_actions;
 
 /* One sequencing authority for production recovery and the deterministic test
  * adapters: cancellation and provisional state clearing always precede a clean
- * non-consuming load, exact prompt replay, and failure invalidation. */
+ * non-consuming load, with invalidation if that load fails. */
 static bool abort_recovery_run(const abort_recovery_actions *a) {
     if (!a || !a->mark_cancelled || !a->clear_live_state ||
-        !a->load_clean_prefix || !a->replay_prompt || !a->invalidate)
+        !a->load_clean_prefix || !a->invalidate)
         return false;
     a->mark_cancelled(a->ud);
     a->clear_live_state(a->ud);
-    if (!a->load_clean_prefix(a->ud) || !a->replay_prompt(a->ud)) {
+    if (!a->load_clean_prefix(a->ud)) {
         a->invalidate(a->ud);
         return false;
     }
@@ -12267,15 +12256,11 @@ typedef struct {
     server_slot *slot;
     job *j;
     const request *req;
-    const ds4_tokens *prompt;
     const char *ctx;
     const char *reason;
     uint64_t trace_id;
-    ds4_tokens loaded_prompt;
     char *loaded_path;
     int loaded_tokens;
-    char loaded_sha[41];
-    char error[160];
 } server_abort_recovery;
 
 static void server_abort_mark_cancelled(void *ud) {
@@ -12294,25 +12279,14 @@ static bool server_abort_load_clean_prefix(void *ud) {
         !r->req->prompt_text[0])
         return false;
 
-    int prefix_tokens = 0;
-    kv_cache_best_text_prefix_sha(r->s, r->slot, r->req->prompt_text,
-                                  r->loaded_sha, &prefix_tokens);
-    (void)prefix_tokens;
     /* The request remains broadly cancelled, but recovery I/O itself must not
      * inherit that callback or the clean load would self-cancel. */
     ds4_session_set_cancel(r->slot->session, NULL, NULL);
     r->loaded_tokens = kv_cache_try_load_text(
-        r->s, r->slot, r->req->prompt_text, &r->loaded_prompt,
+        r->s, r->slot, r->req->prompt_text, NULL,
         &r->loaded_path, NULL, r->req->api == API_RESPONSES);
     ds4_session_set_cancel(r->slot->session, job_cancelled, r->j);
     return r->loaded_tokens > 0;
-}
-
-static bool server_abort_replay_prompt(void *ud) {
-    server_abort_recovery *r = ud;
-    return server_session_sync_recovery(r->s, r->slot, r->prompt,
-                                        r->error, sizeof(r->error)) == 0 &&
-           ds4_session_pos(r->slot->session) == r->prompt->len;
 }
 
 static void server_abort_invalidate(void *ud) {
@@ -12341,17 +12315,16 @@ static bool restore_clean_prompt_frontier(server *s, server_slot *slot,
         .slot = slot,
         .j = j,
         .req = &j->req,
-        .prompt = prompt,
         .ctx = ctx,
         .reason = reason,
         .trace_id = trace_id,
     };
     server_log(DS4_LOG_WARNING,
-               "ds4-server: request aborted; restoring clean prompt frontier ctx=%s prompt=%d reason=\"%s\"",
+               "ds4-server: request aborted; restoring clean abort checkpoint ctx=%s prompt=%d reason=\"%s\"",
                ctx ? ctx : "?", prompt->len,
                reason && reason[0] ? reason : "request cancelled");
     trace_event(s, trace_id,
-                "request aborted; restoring clean prompt frontier prompt=%d reason=%s",
+                "request aborted; restoring clean abort checkpoint prompt=%d reason=%s",
                 prompt->len,
                 reason && reason[0] ? reason : "request cancelled");
 
@@ -12360,31 +12333,27 @@ static bool restore_clean_prompt_frontier(server *s, server_slot *slot,
         .mark_cancelled = server_abort_mark_cancelled,
         .clear_live_state = server_abort_clear_live_state,
         .load_clean_prefix = server_abort_load_clean_prefix,
-        .replay_prompt = server_abort_replay_prompt,
         .invalidate = server_abort_invalidate,
     };
     bool ok = abort_recovery_run(&actions);
     if (ok) {
         server_log(DS4_LOG_KVCACHE,
-                   "ds4-server: clean prompt frontier restored ctx=%s cached=%d replayed=%d target=%d file=%s",
+                   "ds4-server: clean abort checkpoint restored ctx=%s cached=%d deferred_replay=%d target=%d file=%s",
                    ctx ? ctx : "?", r.loaded_tokens,
                    prompt->len - r.loaded_tokens, prompt->len,
                    r.loaded_path ? r.loaded_path : "");
         trace_event(s, trace_id,
-                    "clean prompt frontier restored: cached=%d replayed=%d target=%d file=%s",
+                    "clean abort checkpoint restored: cached=%d deferred_replay=%d target=%d file=%s",
                     r.loaded_tokens, prompt->len - r.loaded_tokens, prompt->len,
                     r.loaded_path ? r.loaded_path : "");
     } else {
         server_log(DS4_LOG_WARNING,
-                   "ds4-server: abort recovery invalidated slot=%d ctx=%s cached=%d target=%d error=\"%s\"",
-                   slot->id, ctx ? ctx : "?", r.loaded_tokens, prompt->len,
-                   r.error[0] ? r.error : "clean checkpoint load failed");
+                   "ds4-server: abort recovery invalidated slot=%d ctx=%s cached=%d target=%d error=\"clean checkpoint load failed\"",
+                   slot->id, ctx ? ctx : "?", r.loaded_tokens, prompt->len);
         trace_event(s, trace_id,
-                    "abort recovery invalidated slot: cached=%d target=%d error=%s",
-                    r.loaded_tokens, prompt->len,
-                    r.error[0] ? r.error : "clean checkpoint load failed");
+                    "abort recovery invalidated slot: cached=%d target=%d error=clean checkpoint load failed",
+                    r.loaded_tokens, prompt->len);
     }
-    ds4_tokens_free(&r.loaded_prompt);
     free(r.loaded_path);
     return ok;
 }
