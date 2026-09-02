@@ -10592,7 +10592,7 @@ static void usage_record_request_complete(server *s, const request *r,
     pthread_mutex_unlock(&s->usage_mu);
 }
 
-static const char *find_next_dsml_tool_block(const char *p, const char **end_out) {
+static const char *find_next_tool_block(const char *p, const char **end_out) {
     struct block_form {
         const char *start;
         const char *end;
@@ -10615,6 +10615,29 @@ static const char *find_next_dsml_tool_block(const char *p, const char **end_out
         best = s;
         best_end = e + strlen(forms[i].end);
     }
+
+    /* GLM has no outer container; replay memory retains adjacent calls as one
+     * sampled block, including whitespace between them. */
+    const char *glm = strstr(p, "<tool_call>");
+    if (glm) {
+        const char *e = strstr(glm, "</tool_call>");
+        if (e) {
+            e += strlen("</tool_call>");
+            for (;;) {
+                const char *next = skip_ascii_ws(e);
+                if (strncmp(next, "<tool_call>", strlen("<tool_call>"))) break;
+                const char *next_end = strstr(next, "</tool_call>");
+                if (!next_end) break;
+                e = next_end + strlen("</tool_call>");
+            }
+            const char *s = glm >= p + 2 && glm[-2] == '\n' && glm[-1] == '\n' ?
+                            glm - 2 : glm;
+            if (!best || s < best) {
+                best = s;
+                best_end = e;
+            }
+        }
+    }
     if (end_out) *end_out = best_end;
     return best;
 }
@@ -10629,10 +10652,16 @@ static bool kv_tool_map_measure_locked(server *s, const char *text,
     const char *p = text;
     for (;;) {
         const char *end = NULL;
-        const char *start = find_next_dsml_tool_block(p, &end);
+        const char *start = find_next_tool_block(p, &end);
         if (!start || !end) break;
         tool_memory_block *b =
             tool_memory_find_block_locked(&s->tool_mem, start, (size_t)(end - start));
+        const char *with_ws = skip_ascii_ws(end);
+        if (!b && with_ws != end) {
+            b = tool_memory_find_block_locked(&s->tool_mem, start,
+                                              (size_t)(with_ws - start));
+            if (b) end = with_ws;
+        }
         if (b && b->seen != scan) {
             b->seen = scan;
             for (tool_memory_entry *e = b->entries; e; e = e->block_next) {
@@ -10697,10 +10726,16 @@ static bool kv_tool_map_write(server *s, FILE *fp, const char *text,
     const char *p = text;
     for (;;) {
         const char *end = NULL;
-        const char *start = find_next_dsml_tool_block(p, &end);
+        const char *start = find_next_tool_block(p, &end);
         if (!start || !end || !ok) break;
         tool_memory_block *b =
             tool_memory_find_block_locked(&s->tool_mem, start, (size_t)(end - start));
+        const char *with_ws = skip_ascii_ws(end);
+        if (!b && with_ws != end) {
+            b = tool_memory_find_block_locked(&s->tool_mem, start,
+                                              (size_t)(with_ws - start));
+            if (b) end = with_ws;
+        }
         if (b && b->seen != scan) {
             b->seen = scan;
             for (tool_memory_entry *e = b->entries; ok && e; e = e->block_next) {
@@ -19897,7 +19932,29 @@ static void test_kv_cache_lookup_rejects_stale_payload_abi(void) {
     rmdir(dir);
 }
 
-static void test_kv_tool_map_filters_by_dsml_text(void) {
+static void test_kv_tool_block_scanner_recognizes_mixed_syntax(void) {
+    const char *text =
+        "plain text\n\n"
+        "<tool_call>read<arg_key>path</arg_key><arg_value>a</arg_value></tool_call>"
+        "<tool_call>bash<arg_key>command</arg_key><arg_value>b</arg_value></tool_call>"
+        " plain "
+        "<tool_calls><invoke name=\"old\"></invoke></tool_calls> tail";
+    const char *glm = strstr(text, "\n\n<tool_call>");
+    const char *glm_end = strstr(glm, "</tool_call><tool_call>");
+    glm_end = strstr(glm_end + 1, "</tool_call>") + strlen("</tool_call>");
+    const char *dsml = strstr(glm_end, "<tool_calls>");
+    const char *dsml_end = strstr(dsml, "</tool_calls>") + strlen("</tool_calls>");
+    const char *end = NULL;
+
+    TEST_ASSERT(find_next_tool_block(text, &end) == glm);
+    TEST_ASSERT(end == glm_end);
+    TEST_ASSERT(find_next_tool_block(end, &end) == dsml);
+    TEST_ASSERT(end == dsml_end);
+    TEST_ASSERT(find_next_tool_block(end, &end) == NULL);
+    TEST_ASSERT(end == NULL);
+}
+
+static void test_kv_tool_map_filters_by_checkpoint_text(void) {
     const char *dsml_keep =
         "\n\n<｜DSML｜tool_calls>\n"
         "<｜DSML｜invoke name=\"bash\">\n"
@@ -19910,23 +19967,34 @@ static void test_kv_tool_map_filters_by_dsml_text(void) {
         "<｜DSML｜parameter name=\"command\" string=\"true\">zzzz</｜DSML｜parameter>\n"
         "</｜DSML｜invoke>\n"
         "</｜DSML｜tool_calls>";
+    const char *glm_keep =
+        "\n\n<tool_call>read"
+        "<arg_key>path</arg_key><arg_value>/tmp/exact</arg_value>"
+        "</tool_call>";
+    buf checkpoint = {0};
+    buf_puts(&checkpoint, "plain before");
+    buf_puts(&checkpoint, dsml_keep);
+    buf_puts(&checkpoint, " plain between ");
+    buf_puts(&checkpoint, glm_keep);
+    buf_puts(&checkpoint, " plain after");
 
     server src = {0}, dst = {0};
     pthread_mutex_init(&src.tool_mu, NULL);
     pthread_mutex_init(&dst.tool_mu, NULL);
     tool_memory_put(&src, "call_keep", dsml_keep);
     tool_memory_put(&src, "call_drop", dsml_drop);
+    tool_memory_put(&src, "call_glm", glm_keep);
 
     FILE *fp = tmpfile();
     TEST_ASSERT(fp != NULL);
     uint64_t estimated_bytes = 0;
-    TEST_ASSERT(kv_tool_map_serialized_size(&src, dsml_keep, &estimated_bytes));
+    TEST_ASSERT(kv_tool_map_serialized_size(&src, checkpoint.ptr, &estimated_bytes));
     uint64_t bytes = 0;
-    TEST_ASSERT(kv_tool_map_write(&src, fp, dsml_keep, &bytes));
+    TEST_ASSERT(kv_tool_map_write(&src, fp, checkpoint.ptr, &bytes));
     TEST_ASSERT(bytes > 0);
     TEST_ASSERT(estimated_bytes == bytes);
     rewind(fp);
-    TEST_ASSERT(kv_tool_map_load_from_pos(&dst, fp, NULL) == 1);
+    TEST_ASSERT(kv_tool_map_load_from_pos(&dst, fp, NULL) == 2);
 
     chat_msgs msgs = {0};
     chat_msg a = {0};
@@ -19939,17 +20007,25 @@ static void test_kv_tool_map_filters_by_dsml_text(void) {
     tool_call drop = {.id = xstrdup("call_drop"), .name = xstrdup("bash"), .arguments = xstrdup("{}")};
     tool_calls_push(&b.calls, drop);
     chat_msgs_push(&msgs, b);
+    chat_msg c = {0};
+    c.role = xstrdup("assistant");
+    tool_call glm = {.id = xstrdup("call_glm"), .name = xstrdup("read"), .arguments = xstrdup("{}")};
+    tool_calls_push(&c.calls, glm);
+    chat_msgs_push(&msgs, c);
     tool_replay_stats stats = {0};
     tool_memory_attach_to_messages(&dst, &msgs, &stats);
     TEST_ASSERT(msgs.v[0].calls.raw_tool_text != NULL);
     TEST_ASSERT(msgs.v[1].calls.raw_tool_text == NULL);
-    TEST_ASSERT(stats.disk == 1);
+    TEST_ASSERT(msgs.v[2].calls.raw_tool_text != NULL);
+    TEST_ASSERT(stats.disk == 2);
     TEST_ASSERT(stats.canonical == 1);
     TEST_ASSERT(stats.missing_ids == 1);
     TEST_ASSERT(strstr(msgs.v[0].calls.raw_tool_text, "pwd") != NULL);
     TEST_ASSERT(strstr(msgs.v[0].calls.raw_tool_text, "zzzz") == NULL);
+    TEST_ASSERT(!strcmp(msgs.v[2].calls.raw_tool_text, glm_keep));
 
     chat_msgs_free(&msgs);
+    buf_free(&checkpoint);
     if (fp) fclose(fp);
     tool_memory_free(&src.tool_mem);
     tool_memory_free(&dst.tool_mem);
@@ -19957,76 +20033,140 @@ static void test_kv_tool_map_filters_by_dsml_text(void) {
     pthread_mutex_destroy(&dst.tool_mu);
 }
 
-static void test_kv_tool_map_restores_before_prompt_render(void) {
-    char tmpl[] = "/tmp/ds4-kv-tool-map-test.XXXXXX";
+static void test_kv_glm_tool_map_real_checkpoint_round_trip(void) {
+    char tmpl[] = "/tmp/ds4-kv-glm-tool-map-test.XXXXXX";
     char *dir = mkdtemp(tmpl);
     TEST_ASSERT(dir != NULL);
     if (!dir) return;
 
-    const char *sha = "3333333333333333333333333333333333333333";
-    char name[44];
-    snprintf(name, sizeof(name), "%.40s.kv", sha);
-    char *path = path_join(dir, name);
-    const char *dsml =
-        "\n\n<｜DSML｜tool_calls>\n"
-        "<｜DSML｜invoke name=\"bash\">\n"
-        "<｜DSML｜parameter name=\"command\" string=\"true\">echo exact</｜DSML｜parameter>\n"
-        "</｜DSML｜invoke>\n"
-        "</｜DSML｜tool_calls>";
-    const char *text = dsml;
-
+    const char *glm =
+        "\n\n<tool_call>bash"
+        "<arg_key>timeout</arg_key><arg_value>10</arg_value>"
+        "<arg_key>command</arg_key><arg_value>echo exact</arg_value>"
+        "</tool_call>\n";
     server src = {0};
     pthread_mutex_init(&src.tool_mu, NULL);
-    tool_memory_put(&src, "call_disk", dsml);
+    tool_memory_put(&src, "call_disk", glm);
 
+    chat_msgs msgs = {0};
+    chat_msg user = {.role = xstrdup("user"), .content = xstrdup("run it")};
+    chat_msgs_push(&msgs, user);
+    chat_msg assistant = {0};
+    assistant.role = xstrdup("assistant");
+    assistant.reasoning = xstrdup("need shell");
+    assistant.content = xstrdup("");
+    tool_call tc = {
+        .id = xstrdup("call_disk"),
+        .name = xstrdup("bash"),
+        .arguments = xstrdup("{\"command\":\"echo canonical\",\"timeout\":10}"),
+    };
+    tool_calls_push(&assistant.calls, tc);
+    chat_msgs_push(&msgs, assistant);
+    chat_msg result = {.role = xstrdup("tool"), .content = xstrdup("done")};
+    chat_msg_add_tool_call_id(&result, "call_disk");
+    chat_msgs_push(&msgs, result);
+
+    tool_memory_attach_to_messages(&src, &msgs, NULL);
+    char *before = render_chat_prompt_text_for_syntax(
+        SERVER_MODEL_SYNTAX_GLM, &msgs, NULL, NULL, DS4_THINK_HIGH);
+    TEST_ASSERT(strstr(before, "echo exact") != NULL);
+    TEST_ASSERT(strstr(before, "echo canonical") == NULL);
+
+    char sha[41], name[44];
+    sha1_bytes_hex(before, strlen(before), sha);
+    snprintf(name, sizeof(name), "%.40s.kv", sha);
+    char *path = path_join(dir, name);
     FILE *fp = fopen(path, "wb");
     TEST_ASSERT(fp != NULL);
     if (fp) {
         uint8_t h[KV_CACHE_FIXED_HEADER];
-        kv_fill_header(h, 2, KV_REASON_CONTINUED, KV_EXT_TOOL_MAP, 512, 0, 32768, 100, 100, 0);
+        kv_fill_header(h, 2, KV_REASON_CONTINUED,
+                       KV_EXT_TOOL_MAP | KV_EXT_THINKING_VISIBLE,
+                       512, 0, 32768, 100, 100, 0);
         uint8_t text_len[4];
-        le_put32(text_len, (uint32_t)strlen(text));
+        le_put32(text_len, (uint32_t)strlen(before));
         TEST_ASSERT(fwrite(h, 1, sizeof(h), fp) == sizeof(h));
         TEST_ASSERT(fwrite(text_len, 1, sizeof(text_len), fp) == sizeof(text_len));
-        TEST_ASSERT(fwrite(text, 1, strlen(text), fp) == strlen(text));
-        uint64_t ignored = 0;
-        TEST_ASSERT(kv_tool_map_write(&src, fp, dsml, &ignored));
+        TEST_ASSERT(fwrite(before, 1, strlen(before), fp) == strlen(before));
+        uint64_t trailer_bytes = 0;
+        TEST_ASSERT(kv_tool_map_write(&src, fp, before, &trailer_bytes));
+        TEST_ASSERT(trailer_bytes > 0);
         TEST_ASSERT(fclose(fp) == 0);
     }
 
+    free(msgs.v[1].calls.raw_tool_text);
+    msgs.v[1].calls.raw_tool_text = NULL;
     server dst = {0};
     pthread_mutex_init(&dst.tool_mu, NULL);
     dst.kv.enabled = true;
     dst.kv.dir = xstrdup(dir);
     dst.kv.opt = kv_cache_default_options();
-
-    chat_msgs msgs = {0};
-    chat_msg a = {0};
-    a.role = xstrdup("assistant");
-    tool_call tc = {0};
-    tc.id = xstrdup("call_disk");
-    tc.name = xstrdup("bash");
-    tc.arguments = xstrdup("{\"command\":\"echo canonical\"}");
-    tool_calls_push(&a.calls, tc);
-    chat_msgs_push(&msgs, a);
+    TEST_ASSERT(dst.tool_mem.entries == 0);
 
     kv_cache_restore_tool_memory_for_messages(&dst, &msgs);
     tool_replay_stats stats = {0};
     tool_memory_attach_to_messages(&dst, &msgs, &stats);
-    TEST_ASSERT(msgs.v[0].calls.raw_tool_text != NULL);
     TEST_ASSERT(stats.disk == 1);
     TEST_ASSERT(stats.canonical == 0);
-    char *prompt = render_chat_prompt_text(&msgs, NULL, NULL, DS4_THINK_HIGH);
-    TEST_ASSERT(strstr(prompt, "echo exact") != NULL);
-    TEST_ASSERT(strstr(prompt, "echo canonical") == NULL);
+    TEST_ASSERT(msgs.v[1].calls.raw_tool_text != NULL);
+    TEST_ASSERT(!strcmp(msgs.v[1].calls.raw_tool_text, glm));
+    char *after = render_chat_prompt_text_for_syntax(
+        SERVER_MODEL_SYNTAX_GLM, &msgs, NULL, NULL, DS4_THINK_HIGH);
+    TEST_ASSERT(!strcmp(before, after));
 
-    free(prompt);
+    buf resumed = {0};
+    buf_puts(&resumed, after);
+    buf_puts(&resumed, " resumed suffix");
+    TEST_ASSERT(ds4_kvstore_find_text_prefix(&dst.kv, resumed.ptr,
+                                             0, 2, 32768) >= 0);
+
+    buf_free(&resumed);
+    free(after);
+    free(before);
     chat_msgs_free(&msgs);
     kv_cache_close(&dst.kv);
     tool_memory_free(&src.tool_mem);
     tool_memory_free(&dst.tool_mem);
     pthread_mutex_destroy(&src.tool_mu);
     pthread_mutex_destroy(&dst.tool_mu);
+    unlink(path);
+    free(path);
+    rmdir(dir);
+}
+
+static void test_kv_old_format_without_tool_map_still_loads(void) {
+    char tmpl[] = "/tmp/ds4-kv-old-format-test.XXXXXX";
+    char *dir = mkdtemp(tmpl);
+    TEST_ASSERT(dir != NULL);
+    if (!dir) return;
+
+    const char *text = "old thinking-visible checkpoint";
+    char sha[41], name[44];
+    sha1_bytes_hex(text, strlen(text), sha);
+    snprintf(name, sizeof(name), "%.40s.kv", sha);
+    char *path = path_join(dir, name);
+    FILE *fp = fopen(path, "wb");
+    TEST_ASSERT(fp != NULL);
+    if (fp) {
+        uint8_t h[KV_CACHE_FIXED_HEADER];
+        kv_fill_header(h, 2, KV_REASON_CONTINUED, KV_EXT_THINKING_VISIBLE,
+                       512, 0, 32768, 100, 100, 0);
+        uint8_t text_len[4];
+        le_put32(text_len, (uint32_t)strlen(text));
+        TEST_ASSERT(fwrite(h, 1, sizeof(h), fp) == sizeof(h));
+        TEST_ASSERT(fwrite(text_len, 1, sizeof(text_len), fp) == sizeof(text_len));
+        TEST_ASSERT(fwrite(text, 1, strlen(text), fp) == strlen(text));
+        TEST_ASSERT(fclose(fp) == 0);
+    }
+
+    kv_disk_cache kc = {0};
+    kc.enabled = true;
+    kc.dir = xstrdup(dir);
+    kc.opt = kv_cache_default_options();
+    TEST_ASSERT(ds4_kvstore_find_text_prefix(
+        &kc, "old thinking-visible checkpoint and suffix", 0, 2, 32768) >= 0);
+
+    kv_cache_close(&kc);
     unlink(path);
     free(path);
     rmdir(dir);
@@ -21017,8 +21157,10 @@ static void ds4_server_unit_tests_run(void) {
     test_exact_dsml_tool_replay_can_be_disabled();
     test_dsml_decode_state_separates_structure_and_payload();
     test_tool_memory_max_ids_prunes_oldest();
-    test_kv_tool_map_filters_by_dsml_text();
-    test_kv_tool_map_restores_before_prompt_render();
+    test_kv_tool_block_scanner_recognizes_mixed_syntax();
+    test_kv_tool_map_filters_by_checkpoint_text();
+    test_kv_glm_tool_map_real_checkpoint_round_trip();
+    test_kv_old_format_without_tool_map_still_loads();
     test_thinking_checkpoint_canonical_matches_future_prompt();
     test_thinking_canonical_empty_content();
     test_thinking_canonical_multi_turn();
