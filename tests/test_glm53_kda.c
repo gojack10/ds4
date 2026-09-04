@@ -72,6 +72,404 @@ static float bf16_to_f32(uint16_t value) {
     return bits.f;
 }
 
+/* Normal-range only, and truncating rather than rounding.  Both are fine here:
+ * the compound-producer fixture uses values with at most seven explicit
+ * mantissa bits, well inside the half normal range, so truncation to ten bits
+ * is exact and the encoding round-trips. */
+static uint16_t f32_to_f16(float value) {
+    union { float f; uint32_t u; } b = { .f = value };
+    const uint32_t sign = (b.u >> 16) & 0x8000u;
+    const int32_t  exp  = (int32_t)((b.u >> 23) & 0xffu) - 127 + 15;
+    const uint32_t mant = (b.u >> 13) & 0x3ffu;
+    if (exp <= 0 || exp >= 31) return (uint16_t)sign;
+    return (uint16_t)(sign | ((uint32_t)exp << 10) | mant);
+}
+
+static float f16_to_f32(uint16_t value) {
+    const uint32_t sign = (uint32_t)(value & 0x8000u) << 16;
+    const uint32_t exp  = (uint32_t)(value >> 10) & 0x1fu;
+    const uint32_t mant = (uint32_t)value & 0x3ffu;
+    union { uint32_t u; float f; } b;
+    b.u = exp == 0 ? sign : (sign | ((exp - 15u + 127u) << 23) | (mant << 13));
+    return b.f;
+}
+
+/* Exercises ds4_gpu_glm53_matmul_bf16 at one width.  The reference is
+ * accumulated in double and compared with a relative tolerance; a stride or
+ * indexing error moves a result far more than that, which is what this is
+ * here to catch. */
+static void check_bf16_matmul(const uint8_t *model, size_t model_bytes,
+                              uint64_t offset, uint32_t in_dim,
+                              uint32_t out_dim, uint32_t rows,
+                              const char *what) {
+    uint16_t *w = (uint16_t *)(void *)((uint8_t *)(uintptr_t)model + offset);
+    for (uint32_t o = 0; o < out_dim; o++) {
+        for (uint32_t i = 0; i < in_dim; i++) {
+            w[(size_t)o * in_dim + i] = f32_to_bf16(
+                0.002f * (float)((int)(o % 11u) - 5) +
+                0.001f * (float)((int)(i % 13u) - 6));
+        }
+    }
+    const size_t x_bytes   = (size_t)rows * in_dim * sizeof(float);
+    const size_t out_bytes = (size_t)rows * out_dim * sizeof(float);
+    float *x        = malloc(x_bytes);
+    float *expected = malloc(out_bytes);
+    float *actual   = malloc(out_bytes);
+    require_ok(x && expected && actual, "wide BF16 host allocation");
+    for (uint32_t r = 0; r < rows; r++) {
+        for (uint32_t i = 0; i < in_dim; i++) {
+            x[(size_t)r * in_dim + i] =
+                0.02f * (float)((int)(i % 17u) - 8) + 0.005f * (float)r;
+        }
+        for (uint32_t o = 0; o < out_dim; o++) {
+            double sum = 0.0;
+            for (uint32_t i = 0; i < in_dim; i++) {
+                sum += (double)bf16_to_f32(w[(size_t)o * in_dim + i]) *
+                       (double)x[(size_t)r * in_dim + i];
+            }
+            expected[(size_t)r * out_dim + o] = (float)sum;
+        }
+    }
+    ds4_gpu_tensor *gx   = ds4_gpu_tensor_alloc(x_bytes);
+    ds4_gpu_tensor *gout = ds4_gpu_tensor_alloc(out_bytes);
+    require_ok(gx && gout, "wide BF16 tensor allocation");
+    require_ok(ds4_gpu_tensor_write(gx, 0, x, x_bytes), "wide BF16 input write");
+
+    require_ok(ds4_gpu_glm53_matmul_bf16(gout, model, model_bytes, offset,
+                                         in_dim, out_dim, gx, 1), what);
+    require_ok(ds4_gpu_tensor_read(gout, 0, actual, out_dim * sizeof(float)),
+               "wide BF16 decode output read");
+    for (uint32_t o = 0; o < out_dim; o++) {
+        require_close(what, actual[o], expected[o],
+                      2e-5f * (fabsf(expected[o]) + 1.0f));
+    }
+
+    require_ok(ds4_gpu_glm53_matmul_bf16(gout, model, model_bytes, offset,
+                                         in_dim, out_dim, gx, rows), what);
+    require_ok(ds4_gpu_tensor_read(gout, 0, actual, out_bytes),
+               "wide BF16 prefill output read");
+    for (uint32_t i = 0; i < rows * out_dim; i++) {
+        require_close(what, actual[i], expected[i],
+                      2e-5f * (fabsf(expected[i]) + 1.0f));
+    }
+    ds4_gpu_tensor_free(gx);
+    ds4_gpu_tensor_free(gout);
+    free(x);
+    free(expected);
+    free(actual);
+}
+
+#ifdef __APPLE__
+/*
+ * Split-versus-generic indexed decode attention.
+ *
+ * GLM 5.3 decode runs kernel_glm_attention_indexed_decode_split_group8 once
+ * more than 512 rows are selected; the generic kernel is what --quality and
+ * every other backend run.  The two score and reduce in different orders, so
+ * each is checked against a double-precision reference and they are checked
+ * against each other with a tolerance rather than bit for bit.
+ *
+ * The selection holds what the GLM 5.3 indexer actually emits: rows at and
+ * past cache_cap and UINT32_MAX tail sentinels, which both kernels must
+ * exclude.  The rows just past cache_cap exist in memory and hold values that
+ * would dominate every softmax, so a kernel that skips the bounds test fails
+ * this loudly rather than by luck.  The row counts cover one partial block,
+ * the 17-, 32-, 16- and 33-block reductions decode can request, the
+ * fixed-count 16-block reduce, and a 65-block request the wrapper must refuse.
+ */
+static void check_split_dsa_attention(uint8_t *model, size_t model_bytes,
+                                      uint64_t value_offset) {
+    enum {
+        SA_HEADS = 16,
+        SA_LORA = 512,
+        SA_NOPE = 64,
+        SA_VALUE = 8,
+        SA_MAX_SELECTED = 4096,
+        SA_CAP = 4163,          /* > SA_MAX_SELECTED and coprime with 7919 */
+        SA_POISON_ROWS = 16,    /* allocated past cache_cap, never to be read */
+        SA_ROWS = SA_CAP + SA_POISON_ROWS,
+        SA_MAX_BLOCKS = 65,
+        SA_Q8_ROW_BYTES = (SA_LORA / 32) * 34,
+    };
+    static const struct {
+        uint32_t n_selected;
+        uint32_t block_rows;
+        bool     accepted;
+    } cases[] = {
+        {8,    32,  true},   /* one partial block */
+        {513,  32,  true},   /* 17 blocks: the first count decode splits */
+        {1024, 32,  true},   /* 32 blocks */
+        {2048, 128, true},   /* 16 blocks: the fixed-count reduce */
+        {2051, 128, true},   /* 17 blocks: GLM 5.3's selection limit */
+        {2051, 64,  true},   /* 33 blocks */
+        {4096, 128, true},   /* 32 blocks: the resident dense window */
+        {2051, 32,  false},  /* 65 blocks: more than the reduce walks */
+    };
+
+    /* Scores need a spread of tens, not a flat softmax, or the running-max
+     * rescale in the split kernel is never exercised.  Each row and head
+     * carries a multiple of one shared basis vector plus small noise, so
+     * scores land in about [-17, 17] with many near-maximal rows. */
+    float base[SA_LORA];
+    for (uint32_t j = 0; j < SA_LORA; j++) {
+        base[j] = (float)((int)((j * 13u) % 17u) - 8) / 8.0f;
+    }
+    uint16_t *kv_bits = malloc((size_t)SA_ROWS * SA_LORA * sizeof(*kv_bits));
+    float *kv = malloc((size_t)SA_ROWS * SA_LORA * sizeof(*kv));
+    float *low = malloc((size_t)SA_HEADS * SA_LORA * sizeof(*low));
+    float *q = calloc((size_t)SA_HEADS * SA_NOPE, sizeof(*q));
+    uint32_t *sel = malloc((size_t)SA_MAX_SELECTED * sizeof(*sel));
+    double *ref = malloc((size_t)SA_HEADS * SA_VALUE * sizeof(*ref));
+    double *lora = malloc((size_t)SA_LORA * sizeof(*lora));
+    float *gen = malloc((size_t)SA_HEADS * SA_VALUE * sizeof(*gen));
+    float *spl = malloc((size_t)SA_HEADS * SA_VALUE * sizeof(*spl));
+    float *spl2 = malloc((size_t)SA_HEADS * SA_VALUE * sizeof(*spl2));
+    float *exact = malloc((size_t)SA_HEADS * SA_VALUE * sizeof(*exact));
+    require_ok(kv_bits && kv && low && q && sel && ref && lora &&
+               gen && spl && spl2 && exact, "split attention host allocation");
+    for (uint32_t row = 0; row < SA_ROWS; row++) {
+        const float a = row < SA_CAP
+            ? (float)((int)(row % 23u) - 11) / 22.0f
+            : 8.0f;   /* poison: would dominate any softmax it leaked into */
+        for (uint32_t j = 0; j < SA_LORA; j++) {
+            const float noise = row < SA_CAP
+                ? (float)((int)((row * 7u + j * 3u + (row ^ j)) % 97u) - 48) / 256.0f
+                : 0.0f;
+            const uint16_t bits = f32_to_f16(a * base[j] + noise);
+            kv_bits[(size_t)row * SA_LORA + j] = bits;
+            kv[(size_t)row * SA_LORA + j] = f16_to_f32(bits);
+        }
+    }
+    for (uint32_t h = 0; h < SA_HEADS; h++) {
+        for (uint32_t j = 0; j < SA_LORA; j++) {
+            low[(size_t)h * SA_LORA + j] =
+                (0.5f + (float)h / 16.0f) * base[j] +
+                (float)((int)((h * 11u + j * 5u) % 61u) - 30) / 240.0f;
+        }
+    }
+    /* Q8_0 value rows with unit scales, so a dequantized weight is its int8. */
+    require_ok(value_offset + (uint64_t)SA_HEADS * SA_VALUE * SA_Q8_ROW_BYTES <= model_bytes,
+               "split attention value rows fit the fixture model");
+    for (uint32_t h = 0; h < SA_HEADS; h++) {
+        for (uint32_t d = 0; d < SA_VALUE; d++) {
+            uint8_t *row = model + value_offset +
+                (size_t)(h * SA_VALUE + d) * SA_Q8_ROW_BYTES;
+            for (uint32_t b = 0; b < SA_LORA / 32u; b++) {
+                const uint16_t one = 0x3c00u;
+                memcpy(row + b * 34u, &one, sizeof(one));
+                int8_t *qs = (int8_t *)(row + b * 34u + 2u);
+                for (uint32_t i = 0; i < 32u; i++) {
+                    qs[i] = (int8_t)((int)((h * 5u + d * 3u + (b * 32u + i) * 7u) % 15u) - 7);
+                }
+            }
+        }
+    }
+
+    ds4_gpu_tensor *heads_gpu = ds4_gpu_tensor_alloc((uint64_t)SA_HEADS * SA_VALUE * sizeof(float));
+    ds4_gpu_tensor *partial_lora_gpu = ds4_gpu_tensor_alloc(
+        (uint64_t)SA_MAX_BLOCKS * SA_HEADS * SA_LORA * sizeof(float));
+    ds4_gpu_tensor *partial_ms_gpu = ds4_gpu_tensor_alloc(
+        (uint64_t)SA_MAX_BLOCKS * SA_HEADS * 2u * sizeof(float));
+    ds4_gpu_tensor *q_gpu = ds4_gpu_tensor_alloc((uint64_t)SA_HEADS * SA_NOPE * sizeof(float));
+    ds4_gpu_tensor *low_gpu = ds4_gpu_tensor_alloc((uint64_t)SA_HEADS * SA_LORA * sizeof(float));
+    ds4_gpu_tensor *kv_gpu = ds4_gpu_tensor_alloc((uint64_t)SA_ROWS * SA_LORA * sizeof(uint16_t));
+    ds4_gpu_tensor *rope_gpu = ds4_gpu_tensor_alloc(sizeof(float));
+    ds4_gpu_tensor *sel_gpu = ds4_gpu_tensor_alloc((uint64_t)SA_MAX_SELECTED * sizeof(uint32_t));
+    ds4_gpu_tensor *exact_scores_gpu = ds4_gpu_tensor_alloc(
+        (uint64_t)SA_HEADS * SA_MAX_SELECTED * sizeof(float));
+    ds4_gpu_tensor *exact_lora_gpu = ds4_gpu_tensor_alloc((uint64_t)SA_HEADS * SA_LORA * sizeof(float));
+    ds4_gpu_tensor *exact_denom_gpu = ds4_gpu_tensor_alloc((uint64_t)SA_HEADS * sizeof(float));
+    require_ok(heads_gpu && partial_lora_gpu && partial_ms_gpu && q_gpu &&
+               low_gpu && kv_gpu && rope_gpu && sel_gpu && exact_scores_gpu &&
+               exact_lora_gpu && exact_denom_gpu,
+               "split attention GPU allocation");
+    require_ok(ds4_gpu_tensor_write(q_gpu, 0, q, (uint64_t)SA_HEADS * SA_NOPE * sizeof(float)) &&
+               ds4_gpu_tensor_write(low_gpu, 0, low, (uint64_t)SA_HEADS * SA_LORA * sizeof(float)) &&
+               ds4_gpu_tensor_write(kv_gpu, 0, kv_bits, (uint64_t)SA_ROWS * SA_LORA * sizeof(uint16_t)),
+               "split attention input write");
+
+    for (size_t c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
+        const uint32_t n = cases[c].n_selected;
+        const uint32_t block_rows = cases[c].block_rows;
+        const uint32_t n_blocks = (n + block_rows - 1u) / block_rows;
+        char what[96];
+        snprintf(what, sizeof(what), "split attention %u rows x %u/block",
+                 n, block_rows);
+
+        /* A permutation of valid rows, with the indexer's failure shapes
+         * scattered through it: rows at and just past cache_cap, and the
+         * UINT32_MAX tail sentinels GLM 5.3's pool expansion emits. */
+        for (uint32_t s = 0; s < n; s++) sel[s] = (s * 7919u) % SA_CAP;
+        sel[0] = SA_CAP;
+        sel[1] = SA_CAP - 1u;
+        for (uint32_t s = 50; s < n; s += 97u) sel[s] = SA_CAP + s % 5u;
+        for (uint32_t s = n >= 3u ? n - 3u : 0u; s < n; s++) sel[s] = UINT32_MAX;
+        require_ok(ds4_gpu_tensor_write(sel_gpu, 0, sel, (uint64_t)n * sizeof(uint32_t)),
+                   "split attention selection write");
+
+        /* The reference follows the generic kernel: score valid rows, drop
+         * the rest, softmax, weighted lora sum, then the value projection. */
+        double ref_scale = 0.0;
+        for (uint32_t h = 0; h < SA_HEADS; h++) {
+            const float *lh = low + (size_t)h * SA_LORA;
+            double max_score = -DBL_MAX;
+            for (uint32_t s = 0; s < n; s++) {
+                if (sel[s] >= SA_CAP) continue;
+                const float *row = kv + (size_t)sel[s] * SA_LORA;
+                double dot = 0.0;
+                for (uint32_t j = 0; j < SA_LORA; j++) dot += (double)lh[j] * row[j];
+                const double score = dot * 0.125;   /* 1/sqrt(SA_NOPE) */
+                if (score > max_score) max_score = score;
+            }
+            double denom = 0.0;
+            for (uint32_t j = 0; j < SA_LORA; j++) lora[j] = 0.0;
+            for (uint32_t s = 0; s < n; s++) {
+                if (sel[s] >= SA_CAP) continue;
+                const float *row = kv + (size_t)sel[s] * SA_LORA;
+                double dot = 0.0;
+                for (uint32_t j = 0; j < SA_LORA; j++) dot += (double)lh[j] * row[j];
+                const double w = exp(dot * 0.125 - max_score);
+                denom += w;
+                for (uint32_t j = 0; j < SA_LORA; j++) lora[j] += w * row[j];
+            }
+            if (denom < 1e-20) denom = 1e-20;
+            for (uint32_t d = 0; d < SA_VALUE; d++) {
+                const uint8_t *row = model + value_offset +
+                    (size_t)(h * SA_VALUE + d) * SA_Q8_ROW_BYTES;
+                double out = 0.0;
+                for (uint32_t j = 0; j < SA_LORA; j++) {
+                    const int8_t qv = (int8_t)row[(j / 32u) * 34u + 2u + j % 32u];
+                    out += (double)qv * (lora[j] / denom);
+                }
+                ref[h * SA_VALUE + d] = out;
+                if (fabs(out) > ref_scale) ref_scale = fabs(out);
+            }
+        }
+
+        const int split_rc = ds4_gpu_glm_attention_indexed_decode_split_group8_tensor(
+            heads_gpu, partial_lora_gpu, partial_ms_gpu, q_gpu, low_gpu,
+            kv_gpu, rope_gpu, model, model_bytes, value_offset, sel_gpu, n,
+            false, SA_CAP, true, SA_HEADS, SA_LORA, SA_NOPE, 0, SA_VALUE, 0,
+            block_rows, n_blocks, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+        if (!cases[c].accepted) {
+            require_ok(split_rc == 0 && n_blocks > 64u,
+                       "split attention refuses more blocks than the reduce walks");
+            continue;
+        }
+        require_ok(split_rc, what);
+        require_ok(ds4_gpu_tensor_read(heads_gpu, 0, spl, (uint64_t)SA_HEADS * SA_VALUE * sizeof(float)),
+                   "split attention output read");
+        require_ok(ds4_gpu_glm_attention_indexed_decode_split_group8_tensor(
+            heads_gpu, partial_lora_gpu, partial_ms_gpu, q_gpu, low_gpu,
+            kv_gpu, rope_gpu, model, model_bytes, value_offset, sel_gpu, n,
+            false, SA_CAP, true, SA_HEADS, SA_LORA, SA_NOPE, 0, SA_VALUE, 0,
+            block_rows, n_blocks, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f), what);
+        require_ok(ds4_gpu_tensor_read(heads_gpu, 0, spl2, (uint64_t)SA_HEADS * SA_VALUE * sizeof(float)),
+                   "split attention repeat read");
+        require_ok(ds4_gpu_glm_attention_indexed_decode_tensor(
+            heads_gpu, q_gpu, low_gpu, kv_gpu, rope_gpu, model, model_bytes,
+            value_offset, sel_gpu, n, SA_CAP, true, SA_HEADS, SA_LORA,
+            SA_NOPE, 0, SA_VALUE, 0, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f),
+            "generic indexed decode attention");
+        require_ok(ds4_gpu_tensor_read(heads_gpu, 0, gen, (uint64_t)SA_HEADS * SA_VALUE * sizeof(float)),
+                   "generic attention output read");
+
+        /* The phased exact kernels claim the generic kernel's arithmetic
+         * operation for operation, so their output must match it bit for
+         * bit -- including the excluded rows and sentinels. */
+        require_ok(ds4_gpu_glm_attention_indexed_decode_exact_tensor(
+            heads_gpu, exact_scores_gpu, exact_lora_gpu, exact_denom_gpu,
+            low_gpu, kv_gpu, model, model_bytes, value_offset, sel_gpu, n,
+            SA_CAP, true, SA_HEADS, SA_LORA, SA_NOPE, 0, SA_VALUE),
+            "exact indexed decode attention");
+        require_ok(ds4_gpu_tensor_read(heads_gpu, 0, exact, (uint64_t)SA_HEADS * SA_VALUE * sizeof(float)),
+                   "exact attention output read");
+        if (memcmp(exact, gen, (size_t)SA_HEADS * SA_VALUE * sizeof(float)) != 0) {
+            double worst = 0.0;
+            for (uint32_t i = 0; i < SA_HEADS * SA_VALUE; i++) {
+                worst = fmax(worst, fabs((double)exact[i] - (double)gen[i]));
+            }
+            fprintf(stderr, "%s: exact kernels differ from the generic kernel (max |delta| %.3g)\n",
+                    what, worst);
+            exit(1);
+        }
+
+        double gen_err = 0.0, spl_err = 0.0, pair_err = 0.0;
+        for (uint32_t i = 0; i < SA_HEADS * SA_VALUE; i++) {
+            if (!isfinite(gen[i]) || !isfinite(spl[i])) {
+                fprintf(stderr, "%s: non-finite output at %u\n", what, i);
+                exit(1);
+            }
+            gen_err = fmax(gen_err, fabs((double)gen[i] - ref[i]));
+            spl_err = fmax(spl_err, fabs((double)spl[i] - ref[i]));
+            pair_err = fmax(pair_err, fabs((double)spl[i] - (double)gen[i]));
+        }
+        if (memcmp(spl, spl2, (size_t)SA_HEADS * SA_VALUE * sizeof(float)) != 0) {
+            fprintf(stderr, "%s: split output changed on repeat\n", what);
+            exit(1);
+        }
+        /* Both kernels accumulate in f32 over up to 2051 rows and 512 lanes;
+         * a tiling, block or bounds error moves a result by a large fraction
+         * of ref_scale, orders of magnitude past this. */
+        const double tol = 1e-4 * ref_scale;
+        fprintf(stderr,
+                "%s: ref_scale %.3g, generic %.3g, split %.3g, split-vs-generic %.3g (tol %.3g), exact == generic\n",
+                what, ref_scale, gen_err, spl_err, pair_err, tol);
+        if (gen_err > tol || spl_err > tol || pair_err > tol) {
+            fprintf(stderr, "%s: attention diverged\n", what);
+            exit(1);
+        }
+    }
+
+    /* GLM 5.2's selections are always in range and it ran the unchecked
+     * variant before GLM 5.3 was admitted; decode now passes false for every
+     * GLM model, which is free of numerical consequence only if the two
+     * variants perform identical arithmetic on valid rows. */
+    for (uint32_t s = 0; s < 2048u; s++) sel[s] = (s * 7919u) % SA_CAP;
+    require_ok(ds4_gpu_tensor_write(sel_gpu, 0, sel, 2048u * sizeof(uint32_t)),
+               "all-valid selection write");
+    for (int assume_valid = 0; assume_valid < 2; assume_valid++) {
+        require_ok(ds4_gpu_glm_attention_indexed_decode_split_group8_tensor(
+            heads_gpu, partial_lora_gpu, partial_ms_gpu, q_gpu, low_gpu,
+            kv_gpu, rope_gpu, model, model_bytes, value_offset, sel_gpu, 2048u,
+            assume_valid != 0, SA_CAP, true, SA_HEADS, SA_LORA, SA_NOPE, 0,
+            SA_VALUE, 0, 128u, 16u, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f),
+            "split attention on an all-valid selection");
+        require_ok(ds4_gpu_tensor_read(heads_gpu, 0, assume_valid ? spl2 : spl,
+                                       (uint64_t)SA_HEADS * SA_VALUE * sizeof(float)),
+                   "all-valid split output read");
+    }
+    if (memcmp(spl, spl2, (size_t)SA_HEADS * SA_VALUE * sizeof(float)) != 0) {
+        fprintf(stderr, "split attention: bounds-checked and unchecked "
+                        "variants differ on an all-valid selection\n");
+        exit(1);
+    }
+
+    ds4_gpu_tensor_free(exact_denom_gpu);
+    ds4_gpu_tensor_free(exact_lora_gpu);
+    ds4_gpu_tensor_free(exact_scores_gpu);
+    ds4_gpu_tensor_free(sel_gpu);
+    ds4_gpu_tensor_free(rope_gpu);
+    ds4_gpu_tensor_free(kv_gpu);
+    ds4_gpu_tensor_free(low_gpu);
+    ds4_gpu_tensor_free(q_gpu);
+    ds4_gpu_tensor_free(partial_ms_gpu);
+    ds4_gpu_tensor_free(partial_lora_gpu);
+    ds4_gpu_tensor_free(heads_gpu);
+    free(exact);
+    free(spl2);
+    free(spl);
+    free(gen);
+    free(lora);
+    free(ref);
+    free(sel);
+    free(q);
+    free(low);
+    free(kv);
+    free(kv_bits);
+}
+#endif
+
 int main(void) {
     enum {
         D = 128,
@@ -96,7 +494,28 @@ int main(void) {
         Q4_OUT = 37,
         Q4_ROWS = 3,
         Q8_OFFSET = 60000,
-        MODEL_BYTES = 65536,
+        /* Real GLM 5.3 widths: 4096 is kda_{q,k,v}, and 512/1024 the
+         * low-rank gate projections. */
+        WIDE512_OFFSET = 65536,   WIDE512_IN = 512,   WIDE512_OUT = 4,
+        WIDE1024_OFFSET = 73728,  WIDE1024_IN = 1024, WIDE1024_OUT = 4,
+        WIDE4096_OFFSET = 90112,  WIDE4096_IN = 4096, WIDE4096_OUT = 2,
+        WIDE_ROWS = 3,
+        /* Compound HC producer fixture.  The f16 and bf16 kernels are two
+         * instantiations of one template, so they get identical weights in
+         * both encodings and must agree exactly. */
+        HC_N = 16384, HC_MIX = 24, HC_EMBD = 4096, HC_HC = 4,
+        HC_F16W_OFFSET  = 131072,   /* HC_N * HC_MIX * 2 = 786432 */
+        HC_BF16W_OFFSET = 917504,
+        HC_SCALE_OFFSET = 1703936,  /* 3 floats  */
+        HC_BASE_OFFSET  = 1703968,  /* 24 floats */
+        HC_NORM_OFFSET  = 1704064,  /* 4096 floats */
+        /* BF16 matvec + HC-expand epilogue fixture */
+        FUSED_W_OFFSET = 1720448,   /* FUSED_IN * FUSED_OUT * 2 = 131072 */
+        FUSED_IN = 1024, FUSED_OUT = 64, FUSED_HC = 4,
+        /* Q8_0 value rows for the split-vs-generic attention check:
+         * 16 heads x 8 values x 544 bytes = 69632 */
+        SPLIT_V_OFFSET = 1851520,
+        MODEL_BYTES = 2097152,
     };
 
     uint8_t *model = mmap(NULL, MODEL_BYTES, PROT_READ | PROT_WRITE,
@@ -179,6 +598,179 @@ int main(void) {
                "BF16 prefill output read");
     for (uint32_t i = 0; i < BF16_ROWS * BF16_OUT; i++)
         require_close("BF16 prefill matmul", bf16_actual[i], bf16_expected[i], 2e-4f);
+
+    /* BF16_IN above is 64; these cover the widths the model actually runs. */
+    check_bf16_matmul(model, MODEL_BYTES, WIDE512_OFFSET, WIDE512_IN,
+                      WIDE512_OUT, WIDE_ROWS, "BF16 matmul in_dim=512");
+    check_bf16_matmul(model, MODEL_BYTES, WIDE1024_OFFSET, WIDE1024_IN,
+                      WIDE1024_OUT, WIDE_ROWS, "BF16 matmul in_dim=1024");
+    check_bf16_matmul(model, MODEL_BYTES, WIDE4096_OFFSET, WIDE4096_IN,
+                      WIDE4096_OUT, WIDE_ROWS, "BF16 matmul in_dim=4096");
+
+    /*
+     * Compound HC producer: the f16 and bf16 kernels share one templated body
+     * and differ only in how the mix weights are widened.  Weights are drawn
+     * from values with at most seven explicit mantissa bits, so each is exact
+     * in BOTH half and bfloat16 and the two kernels see bit-identical floats.
+     * The arithmetic and reduction order are then the same, so the outputs
+     * must match exactly -- any difference is a bug in one instantiation.
+     */
+    {
+        static const float exact_both[8] = {
+            0.5f, -0.5f, 1.0f, -1.0f, 1.5f, -1.5f, 0.25f, -0.75f
+        };
+        uint16_t *hc_f16 = (uint16_t *)(model + HC_F16W_OFFSET);
+        uint16_t *hc_bf16 = (uint16_t *)(model + HC_BF16W_OFFSET);
+        for (uint32_t i = 0; i < (uint32_t)(HC_N * HC_MIX); i++) {
+            const float w = exact_both[i % 8u] * 0.03125f;
+            union { float f; uint32_t u; } b = { .f = w };
+            hc_f16[i] = f32_to_f16(w);
+            hc_bf16[i] = (uint16_t)(b.u >> 16);
+            /* the encodings must round-trip to the same float, or the
+             * comparison below would be measuring the fixture, not the kernel */
+            require_close("HC fixture encoding", f16_to_f32(hc_f16[i]),
+                          bf16_to_f32(hc_bf16[i]), 0.0f);
+        }
+        float *hc_scale = (float *)(model + HC_SCALE_OFFSET);
+        for (int i = 0; i < 3; i++) hc_scale[i] = 0.5f + 0.25f * (float)i;
+        float *hc_base = (float *)(model + HC_BASE_OFFSET);
+        for (int i = 0; i < HC_MIX; i++) hc_base[i] = 0.125f * (float)((i % 5) - 2);
+        float *hc_norm = (float *)(model + HC_NORM_OFFSET);
+        for (int i = 0; i < HC_EMBD; i++) hc_norm[i] = 1.0f + 0.001f * (float)(i % 7);
+
+        float *hc_x = malloc((size_t)HC_N * sizeof(float));
+        require_ok(hc_x != NULL, "HC residual allocation");
+        for (int i = 0; i < HC_N; i++)
+            hc_x[i] = 0.01f * (float)((i % 23) - 11) + 0.002f * (float)(i % 5);
+
+        ds4_gpu_tensor *hc_res = ds4_gpu_tensor_alloc((size_t)HC_N * sizeof(float));
+        require_ok(hc_res != NULL, "HC residual tensor");
+        require_ok(ds4_gpu_tensor_write(hc_res, 0, hc_x,
+                                        (size_t)HC_N * sizeof(float)),
+                   "HC residual write");
+
+        float out_f16[HC_EMBD], out_bf16[HC_EMBD];
+        float nrm_f16[HC_EMBD], nrm_bf16[HC_EMBD];
+        float mix_f16[HC_MIX], mix_bf16[HC_MIX];
+        for (int pass = 0; pass < 2; pass++) {
+            ds4_gpu_tensor *mix = ds4_gpu_tensor_alloc(HC_MIX * sizeof(float));
+            ds4_gpu_tensor *spl = ds4_gpu_tensor_alloc(HC_MIX * sizeof(float));
+            ds4_gpu_tensor *out = ds4_gpu_tensor_alloc(HC_EMBD * sizeof(float));
+            ds4_gpu_tensor *nrm = ds4_gpu_tensor_alloc(HC_EMBD * sizeof(float));
+            require_ok(mix && spl && out && nrm, "HC output tensors");
+            const int rc = pass == 0
+                ? ds4_gpu_hc_rms_norm_mix_split_norm_f16_tensor(
+                      mix, out, nrm, spl, hc_res, model, MODEL_BYTES,
+                      HC_F16W_OFFSET, HC_SCALE_OFFSET, HC_BASE_OFFSET,
+                      HC_NORM_OFFSET, HC_N, HC_MIX, HC_EMBD, HC_HC,
+                      1u, 1.0e-6f, 1.0e-3f, 1.0e-6f)
+                : ds4_gpu_hc_rms_norm_mix_split_norm_bf16_tensor(
+                      mix, out, nrm, spl, hc_res, model, MODEL_BYTES,
+                      HC_BF16W_OFFSET, HC_SCALE_OFFSET, HC_BASE_OFFSET,
+                      HC_NORM_OFFSET, HC_N, HC_MIX, HC_EMBD, HC_HC,
+                      1u, 1.0e-6f, 1.0e-3f, 1.0e-6f);
+            require_ok(rc > 0, pass == 0 ? "HC producer f16" : "HC producer bf16");
+            require_ok(ds4_gpu_tensor_read(mix, 0,
+                           pass == 0 ? mix_f16 : mix_bf16, sizeof(mix_f16)),
+                       "HC mix read");
+            require_ok(ds4_gpu_tensor_read(out, 0,
+                           pass == 0 ? out_f16 : out_bf16, sizeof(out_f16)),
+                       "HC collapse read");
+            require_ok(ds4_gpu_tensor_read(nrm, 0,
+                           pass == 0 ? nrm_f16 : nrm_bf16, sizeof(nrm_f16)),
+                       "HC pre-norm read");
+            ds4_gpu_tensor_free(mix);
+            ds4_gpu_tensor_free(spl);
+            ds4_gpu_tensor_free(out);
+            ds4_gpu_tensor_free(nrm);
+        }
+        for (int i = 0; i < HC_MIX; i++)
+            require_close("HC producer f16 vs bf16 mix", mix_bf16[i], mix_f16[i], 0.0f);
+        for (int i = 0; i < HC_EMBD; i++) {
+            require_close("HC producer f16 vs bf16 collapse", out_bf16[i], out_f16[i], 0.0f);
+            require_close("HC producer f16 vs bf16 pre-norm", nrm_bf16[i], nrm_f16[i], 0.0f);
+        }
+        ds4_gpu_tensor_free(hc_res);
+        free(hc_x);
+    }
+
+    /*
+     * BF16 matvec with the HC expansion folded into its epilogue must equal
+     * the separate matvec followed by ds4_gpu_hc_expand_tensor, exactly.  The
+     * fused kernel reuses the same row accumulation and repeats the expand
+     * arithmetic in the same operand order, so anything but bit-identical
+     * output is a bug -- most likely a stride or an index.
+     */
+    {
+        uint16_t *fw = (uint16_t *)(model + FUSED_W_OFFSET);
+        for (uint32_t o = 0; o < FUSED_OUT; o++) {
+            for (uint32_t i = 0; i < FUSED_IN; i++) {
+                fw[(size_t)o * FUSED_IN + i] = f32_to_bf16(
+                    0.003f * (float)((int)((o * 7u + i) % 17u) - 8));
+            }
+        }
+        float fx[FUSED_IN], fres[FUSED_HC * FUSED_OUT];
+        float fpost[FUSED_HC], fcomb[FUSED_HC * FUSED_HC];
+        for (int i = 0; i < FUSED_IN; i++)
+            fx[i] = 0.01f * (float)((i % 19) - 9);
+        for (int i = 0; i < FUSED_HC * FUSED_OUT; i++)
+            fres[i] = 0.05f * (float)((i % 13) - 6);
+        for (int i = 0; i < FUSED_HC; i++) fpost[i] = 0.25f + 0.125f * (float)i;
+        for (int i = 0; i < FUSED_HC * FUSED_HC; i++)
+            fcomb[i] = 0.1f * (float)((i % 7) - 3);
+
+        ds4_gpu_tensor *tx   = ds4_gpu_tensor_alloc(sizeof(fx));
+        ds4_gpu_tensor *tres = ds4_gpu_tensor_alloc(sizeof(fres));
+        ds4_gpu_tensor *tpost = ds4_gpu_tensor_alloc(sizeof(fpost));
+        ds4_gpu_tensor *tcomb = ds4_gpu_tensor_alloc(sizeof(fcomb));
+        ds4_gpu_tensor *out_ref = ds4_gpu_tensor_alloc(FUSED_OUT * sizeof(float));
+        ds4_gpu_tensor *hc_ref  = ds4_gpu_tensor_alloc(sizeof(fres));
+        ds4_gpu_tensor *out_fus = ds4_gpu_tensor_alloc(FUSED_OUT * sizeof(float));
+        ds4_gpu_tensor *hc_fus  = ds4_gpu_tensor_alloc(sizeof(fres));
+        require_ok(tx && tres && tpost && tcomb && out_ref && hc_ref &&
+                   out_fus && hc_fus, "fused epilogue tensors");
+        require_ok(ds4_gpu_tensor_write(tx, 0, fx, sizeof(fx)) &&
+                   ds4_gpu_tensor_write(tres, 0, fres, sizeof(fres)) &&
+                   ds4_gpu_tensor_write(tpost, 0, fpost, sizeof(fpost)) &&
+                   ds4_gpu_tensor_write(tcomb, 0, fcomb, sizeof(fcomb)),
+                   "fused epilogue inputs");
+
+        require_ok(ds4_gpu_glm53_matmul_bf16(
+                       out_ref, model, MODEL_BYTES, FUSED_W_OFFSET,
+                       FUSED_IN, FUSED_OUT, tx, 1),
+                   "reference BF16 matvec");
+        require_ok(ds4_gpu_hc_expand_tensor(hc_ref, out_ref, tres, tpost, tcomb,
+                                            FUSED_OUT, FUSED_HC),
+                   "reference HC expand");
+
+        const int fused = ds4_gpu_glm53_matmul_bf16_hc_expand4(
+            out_fus, hc_fus, model, MODEL_BYTES, FUSED_W_OFFSET,
+            FUSED_IN, FUSED_OUT, tx, tres, tpost, tcomb, FUSED_HC);
+        if (fused == 0) {
+            fprintf(stderr,
+                    "BF16 matvec + HC expand: not available on this device, skipped\n");
+        } else {
+            float a[FUSED_OUT], b[FUSED_OUT];
+            float ha[FUSED_HC * FUSED_OUT], hb[FUSED_HC * FUSED_OUT];
+            require_ok(ds4_gpu_tensor_read(out_ref, 0, a, sizeof(a)) &&
+                       ds4_gpu_tensor_read(out_fus, 0, b, sizeof(b)) &&
+                       ds4_gpu_tensor_read(hc_ref, 0, ha, sizeof(ha)) &&
+                       ds4_gpu_tensor_read(hc_fus, 0, hb, sizeof(hb)),
+                       "fused epilogue readback");
+            for (int i = 0; i < FUSED_OUT; i++)
+                require_close("fused epilogue block_out", b[i], a[i], 0.0f);
+            for (int i = 0; i < FUSED_HC * FUSED_OUT; i++)
+                require_close("fused epilogue hc stream", hb[i], ha[i], 0.0f);
+        }
+        ds4_gpu_tensor_free(tx);
+        ds4_gpu_tensor_free(tres);
+        ds4_gpu_tensor_free(tpost);
+        ds4_gpu_tensor_free(tcomb);
+        ds4_gpu_tensor_free(out_ref);
+        ds4_gpu_tensor_free(hc_ref);
+        ds4_gpu_tensor_free(out_fus);
+        ds4_gpu_tensor_free(hc_fus);
+    }
 
 #ifdef DS4_ROCM_BUILD
     test_block_q4_K *q4_weights = (test_block_q4_K *)(model + Q4_OFFSET);
@@ -513,6 +1105,8 @@ int main(void) {
     free(f32_attn_cache);
     free(f32_attn_q);
     free(f32_attn_low);
+
+    check_split_dsa_attention(model, MODEL_BYTES, SPLIT_V_OFFSET);
 #endif
 
 #ifdef DS4_ROCM_BUILD
