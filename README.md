@@ -5,7 +5,8 @@
 > **Fork branch:** production hardening for resident GLM 5.3 Flash on Apple M5 Max. See [FORK.md](FORK.md) for the patch stack, deployment profile, verification, and upstream contribution plan.
 
 **DwarfStar** is a small native inference engine optimized first for
-**DeepSeek V4 Flash**. It also supports **GLM 5.2 and 5.3**, **GLM 5.3 Flash**, and,
+**DeepSeek V4 Flash** (including the experimental vision model).
+It also supports **GLM 5.2 and 5.3**, **GLM 5.3 Flash**, and,
 on very high-memory machines, **DeepSeek V4 PRO**. It is self-contained and
 deliberately narrow, not a general GGUF runner. Model loading, prompt rendering,
 tool calls, KV state, the HTTP server, and the coding agent are built and tested together.
@@ -25,6 +26,12 @@ other contributors.
 Model support is intentionally opportunistic. The project follows the best open
 weights for useful local machine sizes, especially 128 GB laptops and 512 GB
 workstations. A model may be removed when a better replacement arrives.
+
+The project has first class support for SSD streaming of weights, so it is
+possible to run models bigger than RAM while often still getting decent
+performances, and even running very large models (like the full GLM 5.3 or DeepSeek v4 PRO)
+on systems with just 128GB of RAM at a slower speed, but fast enough for
+QA-style chats.
 
 # So, what can I do with this software?
 
@@ -211,6 +218,31 @@ For ROCm packages, GTT configuration and the reproducible ROCm 10.0 container bu
 select another supported GGUF from `./gguf/`. Run `./ds4 --help` and
 `./ds4-server --help` for the full flag list.
 
+## DeepSeek V4 Flash Vision Experimental
+
+Vision-Exp is a separate DeepSeek checkpoint, not the 0731 text model. It uses
+a matching language GGUF and a 0.9 GiB vision encoder. The Q2 model is the
+recommended version for 96 and 128 GB systems:
+
+```sh
+./download_model.sh ds4f-vision-q2
+./ds4 --vision gguf/DeepSeek-V4-Flash-Vision-Encoder.gguf
+```
+
+Use `/read image.png` in the interactive CLI. The same `--vision` option gives
+`ds4-agent` its `view_image` tool and enables image input through `ds4-server`.
+PNG and JPEG are supported. The Q2 path is validated on Metal, single-GPU CUDA
+including DGX Spark, and ROCm. Larger `ds4f-vision-q2-q4` and
+`ds4f-vision-mxfp4` downloads are also available.
+
+Vision-Exp has its own DSpark checkpoint. Do not use the 0731 support model:
+
+```sh
+./download_model.sh ds4f-vision-dspark
+./ds4 --vision gguf/DeepSeek-V4-Flash-Vision-Encoder.gguf --dspark \
+  --mtp-model gguf/DeepSeek-V4-Flash-Vision-Exp-DSpark-support.gguf
+```
+
 ## GLM 5.3 Flash
 
 GLM 5.3 Flash uses a separate graph for its recurrent KDA layers, sparse DSA
@@ -366,6 +398,11 @@ Run it with the normal sampling defaults:
 ```
 
 `--mtp-model` supplies the support GGUF, while `--dspark` selects the DSpark runtime.
+Measured on a MacBook Pro M5 Max with the Q2 Flash model fully resident
+(README prose prompt, 128-token context): plain decode 46.5 t/s, DSpark
+36-44 t/s depending on the confidence threshold (30-55% of draft tokens
+accepted; every verified draft row re-streams its routed experts, about a
+third of a token's cost). Expect gains only on highly predictable text.
 The default confidence threshold is `0.6` on Metal and `0.7` on CUDA and ROCm.
 It prunes suffixes that are unlikely to repay their verification cost.
 `--dspark-confidence 0` forces fixed five-token blocks and is intended for
@@ -857,6 +894,78 @@ layer per stage (`--tensor-parallel-token-prefill` selects a slower
 token-by-token prefill that exactly matches the single-machine arithmetic).
 The split graph is deterministic, but its changed floating-point reduction
 order is not generally byte-identical to single-machine execution.
+
+### Running DeepSeek V4 Flash across two 128 GB MacBooks
+
+The same mode runs DeepSeek V4 Flash (145 GB in the MXFP4 recipe, which does
+not fit one 128 GB Mac without SSD streaming). Each Mac keeps its half of the
+routed experts resident (~77 GiB) plus the replicated dense weights; the
+per-layer exchanges are 16 KB and ride as single RDMA messages.
+
+One-time setup per boot, on **both** machines (as for GLM above):
+
+```sh
+sudo sysctl iogpu.wired_limit_mb=120000
+sudo ifconfig en1 inet 10.99.0.2/30 alias     # machine A (coordinator), its Thunderbolt member interface
+sudo ifconfig en6 inet 10.99.0.1/30 alias     # machine B (worker)
+rdma_ctl status                               # "enabled" on both
+```
+
+Both machines need the same tree, the same commit, and the model at the same
+relative path. Start the worker in a terminal that stays open (an interactive
+`ssh -tt` session is fine; a detached `nohup` worker cannot reach the
+coordinator on macOS), then the coordinator; the worker retries until the
+coordinator listens. Do not probe the coordinator's port with `nc` or `curl`
+while it waits: it accepts the probe as the worker and fails.
+
+```sh
+MODEL=gguf/DeepSeek-V4-Flash-Vision-Exp-MXFP4Experts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out.gguf
+VISION=gguf/DeepSeek-V4-Flash-Vision-Encoder.gguf   # omit --vision for the text-only model
+
+# Machine B: worker.
+./ds4 -m "$MODEL" --vision "$VISION" --tensor-parallel --role worker \
+  --coordinator 10.99.0.2 9911 --transport rdma --rdma-device rdma_en6 --rdma-gid-index 1
+
+# Machine A: coordinator, interactive chat (use /read photo.png to send an image).
+./ds4 -m "$MODEL" --vision "$VISION" --tensor-parallel --role coordinator \
+  --listen 10.99.0.2 9911 --transport rdma --rdma-device rdma_en1 --rdma-gid-index 1 -c 8192
+```
+
+The text-only `DeepSeek-V4-Flash-0731-MXFP4Experts-...-chat-v2-mxfp4.gguf`
+file has the same layers and tensor types and runs identically. Other
+quantization recipes (IQ2, Q4_K experts) run too, but the fastest paths gate
+on MXFP4 experts with Q8 attention and shared-expert tensors.
+
+Measured on two M5 Max 128 GB MacBooks over Thunderbolt 5 (MXFP4 recipe,
+README prompt):
+
+| | two Macs, tensor parallel | one Mac, SSD streaming |
+|---|---|---|
+| decode, 128-token context | ~47-48 t/s | ~11 t/s |
+| decode, 2048-token context | ~48 t/s | |
+| prefill | ~250 t/s at 128 tokens, ~850 t/s at 2048 | ~10 t/s |
+| startup | ~10 s per Mac (pins its shard) | |
+| DSpark (`--dspark`) | slower than plain decode here (30-40 t/s: each draft row re-streams its experts) | |
+
+Things that cost speed on the coordinator: a remote screen-sharing session
+or an animated wallpaper (the display compositor takes GPU time from the
+decode, up to 10%), and anything else using the GPU. Benchmark with the
+screen idle. The first run after swapping roles between the two Macs can fail
+at the first prefill round with `timeout waiting for bulk RDMA round`; start
+both again.
+
+The fast paths are on by default; environment variables exist to opt out
+for diagnosis (set them on both machines): `DS4_TP_DISABLE_POLL_GATES=1`
+(shared-event gates instead of the poll gates), `DS4_TP_DISABLE_GATE_PREFETCH=1`,
+`DS4_TP_STATIC_SHARED_SPLIT=1` (fixed shared-expert halves instead of the
+per-token GPU-decided split), `DS4_TP_DISABLE_FLAG_FOLD=1`,
+`DS4_METAL_DISABLE_KV_NORM_DEFER=1`, `DS4_METAL_DISABLE_M5_ROUTER_PROJECT_SELECT_FUSE=1`,
+`DS4_TP_DISABLE_RDMA_WARMUP=1`, `DS4_METAL_DISABLE_MXFP4_MM_ID_MPP=1` (simdgroup
+instead of TensorOps routed-expert prefill GEMMs), `DS4_METAL_DISABLE_QUEUE_KEEPALIVE=1`
+(no idle keepalive on the Metal command queue: the first command buffer after
+~3 s of GPU idleness then starts 600-800 ms late). `DS4_TP_GATE_PROFILE=1` prints per-gate wait
+statistics on each rank at exit; `DS4_METAL_ENCODER_TIMELINE=<file>` writes
+a per-kernel GPU timeline (`misc/tp_tools/tl_analyze.py` reads it).
 
 ## Tensor Parallelism across CUDA GPUs
 
@@ -1725,6 +1834,33 @@ current scale, `/steer 0` disables it, and `/steer F` sets a value from `-100`
 to `100` for subsequent tokens. The existing KV cache is kept. Live changes
 are currently limited to local sessions, not distributed inference or network
 tensor parallelism.
+
+## Conversation Prefixes
+
+`ds4` and `ds4-agent` can preload a conversation with `--prefix-file FILE`.
+The file contains complete `USER:` / `ASSISTANT:` pairs:
+
+```text
+USER: Write terse answers.
+This line is still part of the user turn.
+ASSISTANT: Understood.
+USER: Return code without an introduction.
+ASSISTANT: I will return only the code.
+```
+
+A marker starts a new turn only at the beginning of a line. The prefix must
+start with `USER:`, alternate roles, and end with `ASSISTANT:`. It is rendered
+with the model's chat template and prefilled before the live prompt.
+
+```sh
+./ds4 --prefix-file prefix.txt
+./ds4-agent --prefix-file prefix.txt
+```
+
+This can also overcome refusal behavior. For example, when a multi-turn prefix
+shows the assistant writing exploits as part of computer-security work, most
+models will comply with the next computer-security requests. The effect is
+studied in *Many-shot Jailbreaking*.
 
 ## Test Vectors
 
